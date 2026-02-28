@@ -1,0 +1,56 @@
+# Example configuration file for creating a new REINVENT model (prior)
+# Format: TOML
+# Description: This configuration creates an empty REINVENT model from a SMILES file
+
+run_type = "create_model"
+device = "cuda"  # Use "cpu" if GPU is not available
+seed = 42  # For reproducibility
+
+[parameters]
+# Path to SMILES file - each line should contain one SMILES string
+input_model_file = "path/to/your/smiles.txt"
+
+# Output file - where to save the created model
+output_file = "my_prior.pt"
+
+[network]
+# Network architecture parameters
+
+# Number of recurrent layers
+num_layers = 3
+
+# Size of the hidden state in each layer
+# Larger = more capacity but slower training
+# Typical values: 256, 512, 1024
+layer_size = 512
+
+# Dropout probability (0.0 = no dropout)
+# Use higher values (0.1-0.5) when training on small datasets
+dropout = 0.0
+
+# Maximum length of SMILES string
+max_sequence_length = 256
+
+# Type of recurrent cell: "lstm" or "gru"
+# LSTM is more stable, GRU is faster
+cell_type = "lstm"
+
+# Size of embedding layer
+embedding_layer_size = 128
+
+# Whether to use layer normalization
+# Can help with training stability
+layer_normalization = false
+
+# Whether to standardize SMILES before processing
+# Recommended: true for consistency
+standardize = true
+
+[metadata]
+# Metadata about the dataset
+
+# Source of the data
+data_source = "ChEMBL 33"
+
+# Any additional comments
+comment = "Prior model for drug design task"

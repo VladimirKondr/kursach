@@ -1,0 +1,83 @@
+# Example configuration file for Transfer Learning (training) with REINVENT
+# Format: TOML
+# Description: Train a prior model on your custom dataset
+
+run_type = "transfer_learning"
+device = "cuda"  # Use "cpu" if GPU is not available
+seed = 42  # For reproducibility
+
+# Optional: Directory for TensorBoard logs
+tb_logdir = "./logs/transfer_learning"
+
+# Optional: Save configuration to JSON after successful run
+json_out_config = "./output/config.json"
+
+[parameters]
+# Input/Output files
+
+# Path to pre-trained prior model
+input_model_file = "path/to/my_prior.pt"
+
+# Path to output directory where trained model will be saved
+output_model_file = "path/to/my_trained.pt"
+
+# File with SMILES for training
+# Format: CSV, TSV, or space-separated
+# SMILES should be in the first column
+smiles_file = "path/to/training_molecules.txt"
+
+# Optional: File with validation SMILES
+# Used to monitor overfitting during training
+validation_smiles_file = "path/to/validation_molecules.txt"
+
+# Training parameters
+
+# Number of molecules per batch
+# Larger batch = more stable gradients but more memory
+# Typical values: 32, 64, 128, 256
+batch_size = 64
+
+# Number of complete passes over the dataset
+num_epochs = 20
+
+# Initial learning rate for optimizer
+# Typical values: 1e-4, 1e-5
+learning_rate = 0.0001
+
+# Save model checkpoint every N epochs
+save_every_n_epochs = 5
+
+# Data augmentation parameters
+
+# Generate random SMILES equivalent on every epoch
+# Helps model learn different representations of same molecule
+randomize_all_smiles = true
+
+# Additional random shuffling of SMILES (usually false if using randomize_all_smiles)
+randomize_smiles = false
+
+# Maximum length of SMILES (usually same as prior)
+max_sequence_length = 256
+
+# Optional: Gradient clipping to prevent exploding gradients
+# Set to 0 or remove to disable
+clip_gradient_norm = 1.0
+
+[scheduler]
+# Learning rate scheduler configuration
+
+# Type of scheduler: "step" or "lambda"
+type = "step"
+
+# Initial learning rate
+lr = 0.0001
+
+# Minimum learning rate (won't decrease below this)
+min = 1e-07
+
+# Multiplicative factor for learning rate decay
+# Applied every 'step' epochs
+gamma = 0.95
+
+# Decrease learning rate every N epochs
+step = 5

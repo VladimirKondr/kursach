@@ -1,0 +1,37 @@
+# Example SMILES data file for REINVENT
+# This is a sample file showing the format expected by REINVENT
+# 
+# Each line contains one SMILES string
+# Optional: you can add additional columns after SMILES (they will be ignored)
+# Format examples:
+#   - Simple: CCO
+#   - With activity: CCO 0.75
+#   - CSV: CCO,ethanol,active
+#
+
+# Small alcohols and ethers
+CCO
+CCOC
+CC(C)O
+CCCCC
+c1ccccc1
+
+# Aromatic compounds
+c1ccc(cc1)C(=O)O
+c1ccc(cc1)C
+c1ccc(O)cc1
+
+# Heterocycles
+c1ccncc1
+c1ccoc1
+c1ccsc1
+
+# Drug-like molecules
+CC(C)Cc1ccc(cc1)[C@@H](C)C(O)=O
+CC(=O)Oc1ccccc1C(=O)O
+CN1C=NC2=C1C(=O)N(C(=O)N2C)C
+
+# Complex molecules
+c1ccc2c(c1)ccc3c2ccc4c3cccc4
+CC(C)NCC(COc1ccccc1)O
+CC(C)c1ccc(cc1)[C@@H](C)C(O)=O

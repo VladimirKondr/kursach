@@ -1,0 +1,50 @@
+# Example configuration file for Sampling (inference) with REINVENT
+# Format: TOML
+# Description: Generate molecules using a trained REINVENT model
+
+run_type = "sampling"
+device = "cuda"  # Use "cpu" if GPU is not available
+
+[parameters]
+# Input/Output files
+
+# Path to trained REINVENT model
+model_file = "path/to/my_trained.pt"
+
+# Output file for generated molecules
+# Format: CSV with columns: SMILES, SMILES_state, NLL
+output_file = "generated_molecules.csv"
+
+# Generation parameters
+
+# Total number of molecules to generate
+num_smiles = 1000
+
+# Batch size for processing
+# Larger batch = faster but uses more memory
+batch_size = 100
+
+# Temperature parameter for sampling
+# < 1.0: More conservative (stick to "safer" molecules the model knows)
+# = 1.0: Normal distribution
+# > 1.0: More diverse/random molecules
+temperature = 1.0
+
+# Sampling strategy
+# Options:
+#   "greedy" - always pick the most likely token
+#   "multinomial" - probabilistic sampling (default, more diverse)
+#   "beamsearch" - keep top-K most likely paths (for Mol2Mol, slow but higher quality)
+sample_strategy = "multinomial"
+
+# Whether to randomize the SMILES representation
+# Different valid SMILES represent the same molecule
+# Randomizing can improve diversity
+randomize_smiles = true
+
+# Whether to return only unique SMILES
+# If true, deduplicate the output
+unique_sequences = true
+
+# Optional: seed for reproducibility
+seed = 42
