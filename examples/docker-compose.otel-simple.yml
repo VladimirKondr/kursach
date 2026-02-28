@@ -1,0 +1,25 @@
+# Simplified OpenTelemetry Setup (No SigNoz UI)
+# Use this for quick testing without full Sig Noz stack
+# Telemetry data will be printed to console
+
+version: "3.8"
+
+services:
+  # Simple OTEL Collector that prints to console
+  otel-collector-simple:
+    image: otel/opentelemetry-collector:latest
+    container_name: otel-collector-simple
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-simple.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP  
+      - "8888:8888"   # Prometheus metrics
+    networks:
+      - impala-network
+
+networks:
+  impala-network:
+    name: impala-network
+    driver: bridge

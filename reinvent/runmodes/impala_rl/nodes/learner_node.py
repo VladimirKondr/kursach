@@ -1,15 +1,26 @@
 import json
 import logging
-import torch
-import io
+import time
 import nats
-from nats.errors import TimeoutError
 
 from nats.errors import NoServersError
 
 from reinvent.runmodes.impala_rl.trajectory import Trajectory
 
+# Telemetry imports
+from reinvent.runmodes.impala_rl.telemetry import get_tracer, get_logger
+from reinvent.runmodes.impala_rl.telemetry.traces import create_span
+from reinvent.runmodes.impala_rl.telemetry.propagation import extract_trace_context
+from reinvent.runmodes.impala_rl.telemetry.metrics import (
+    record_duration_metric,
+    record_value_metric,
+    increment_counter_metric,
+    set_gauge_metric,
+)
+
 logger = logging.getLogger(__name__)
+telem_logger = get_logger(__name__)
+tracer = get_tracer(__name__)
 
 class LearnerNode:
     def __init__(
@@ -33,23 +44,32 @@ class LearnerNode:
         self.js = None
 
     async def Connect(self):
-        try:
-            self.nc = await nats.connect(
-                self.queue_url,
-                name="learner",
-                reconnect_time_wait=2,
-                max_reconnect_attempts=-1 
-            )
-            self.js = self.nc.jetstream()
-            self.psub = await self.js.pull_subscribe("jobs.result", durable="center_processor")
-            print("[Learner] Успешно подключен к NATS")
-        except NoServersError:
-            print("[Learner] Не удалось найти сервер NATS")
-            return False
-        except Exception as e:
-            print(f"[Learner] Ошибка подключения: {e}")
-            return False
-        return True
+        with create_span("learner_node.connect", tracer=tracer) as span:
+            try:
+                self.nc = await nats.connect(
+                    self.queue_url,
+                    name="learner",
+                    reconnect_time_wait=2,
+                    max_reconnect_attempts=-1 
+                )
+                self.js = self.nc.jetstream()
+                self.psub = await self.js.pull_subscribe("jobs.result", durable="center_processor")
+                
+                telem_logger.info(
+                    "Learner node connected to NATS",
+                    attributes={"queue_url": self.queue_url}
+                )
+                set_gauge_metric("nats.connection.state", 1, {"component": "learner"})
+                return True
+            except NoServersError:
+                telem_logger.error("Failed to find NATS server", attributes={"queue_url": self.queue_url})
+                set_gauge_metric("nats.connection.state", 0, {"component": "learner"})
+                return False
+            except Exception as e:
+                telem_logger.error(f"Connection error: {str(e)}")
+                increment_counter_metric("nats.errors.total", 1, {"component": "learner", "error_type": "connection"})
+                set_gauge_metric("nats.connection.state", 0, {"component": "learner"})
+                return False
 
     async def GetTrajectories(self, timeout: float = 10.0, batch_size: int = 16) -> list[Trajectory]:
         """Fetch trajectories from NATS queue
@@ -61,40 +81,95 @@ class LearnerNode:
         Returns:
             List of Trajectory objects
         """
-        if not self.psub:
-            print("Ошибка: Нет соединения с JetStream")
+        with create_span(
+            "learner_node.get_trajectories",
+            tracer=tracer,
+            attributes={"batch_size": batch_size, "timeout": timeout}
+        ) as span:
+            if not self.psub:
+                telem_logger.error("No JetStream connection")
+                return []
+
+            retry: int = 0
+            start_time = time.perf_counter()
+            
+            while retry < self.max_retries:
+                retry += 1
+                try:
+                    span.add_event("fetching_messages", {"retry": retry})
+                    fetch_start = time.perf_counter()
+                    msgs = await self.psub.fetch(batch_size, timeout=timeout)
+                    fetch_duration = time.perf_counter() - fetch_start
+                    
+                    trajectories: list[Trajectory] = []
+                    total_message_size = 0
+
+                    for msg in msgs:
+                        # Extract trace context from message headers (not currently used but prepared for future linked spans)
+                        headers = msg.header if hasattr(msg, 'header') else None
+                        _parent_context = extract_trace_context(headers)
+                        
+                        # Deserialize list of trajectory dicts
+                        data_list = json.loads(msg.data.decode())
+                        total_message_size += len(msg.data)
+                        
+                        # Convert each dict to Trajectory object
+                        for traj_dict in data_list:
+                            traj = Trajectory.from_dict(traj_dict)
+                            trajectories.append(traj)
+                        
+                        await msg.ack()
+                    
+                    total_duration = time.perf_counter() - start_time
+                    
+                    # Check queue depth
+                    queue_depth = self.psub.pending_msgs
+                    
+                    # Record metrics
+                    record_duration_metric("learner.batch_collection.duration", total_duration)
+                    record_duration_metric("nats.fetch.duration", fetch_duration)
+                    record_value_metric("nats.queue.depth", queue_depth)
+                    record_value_metric("learner.batch.size", len(trajectories))
+                    record_value_metric("nats.message.total_size_bytes", total_message_size, unit="bytes")
+                    increment_counter_metric("learner.trajectories_fetched.total", len(trajectories))
+                    
+                    span.set_attribute("num_messages", len(msgs))
+                    span.set_attribute("num_trajectories", len(trajectories))
+                    span.set_attribute("queue_depth", queue_depth)
+                    span.set_attribute("retries", retry)
+                    
+                    telem_logger.info(
+                        "Trajectories fetched",
+                        attributes={
+                            "num_trajectories": len(trajectories),
+                            "num_messages": len(msgs),
+                            "queue_depth": queue_depth,
+                            "duration_seconds": total_duration,
+                        }
+                    )
+                    
+                    return trajectories
+                    
+                except nats.errors.TimeoutError:
+                    queue_depth = self.psub.pending_msgs if self.psub else 0
+                    telem_logger.warning(
+                        "Timeout fetching trajectories",
+                        attributes={"retry": retry, "queue_depth": queue_depth}
+                    )
+                    increment_counter_metric("nats.fetch.timeouts.total", 1, {"component": "learner"})
+                    continue
+                except Exception as e:
+                    telem_logger.error(f"Fetch error: {str(e)}")
+                    increment_counter_metric("nats.errors.total", 1, {"component": "learner", "error_type": "fetch"})
+                    raise e
+                    
+            queue_depth = self.psub.pending_msgs if self.psub else 0
+            telem_logger.error(
+                "GetTrajectories ran out of retries",
+                attributes={"queue_depth": queue_depth, "max_retries": self.max_retries}
+            )
+            increment_counter_metric("learner.get_trajectories.failures.total", 1)
             return []
-
-        retry: int = 0
-        
-        while retry < self.max_retries:
-            retry += 1
-            try:
-                msgs = await self.psub.fetch(batch_size, timeout=timeout)
-                trajectories: list[Trajectory] = []
-
-                for msg in msgs:
-                    # Deserialize list of trajectory dicts
-                    data_list = json.loads(msg.data.decode())
-                    
-                    # Convert each dict to Trajectory object
-                    for traj_dict in data_list:
-                        traj = Trajectory.from_dict(traj_dict)
-                        trajectories.append(traj)
-                    
-                    await msg.ack()
-                
-                return trajectories
-                
-            except nats.errors.TimeoutError:
-                logging.log(level=1, msg=f"Timeout on fetching data. Current retry: {retry}. Current size of queue: {self.psub.pending_msgs}")
-                continue
-            except Exception as e:
-                logging.log(level=2, msg=f"Ошибка: {e}")
-                raise e
-                
-        logging.log(level=1, msg=f"GetTrajectories ran out of retries. Current size of queue: {self.psub.pending_msgs}")
-        return []
     
     async def close(self):
         if self.nc:
@@ -108,80 +183,138 @@ class LearnerNode:
         Args:
             model: The model to save
         """
-        try:
-            import torch
-            import io
-            
-            # Increment version
-            self.model_version += 1
-            
-            logger.info(f"[Learner] Committing model version {self.model_version}")
-            
-            # Create or get KV bucket
+        with create_span(
+            "learner_node.commit_model",
+            tracer=tracer,
+            attributes={"version": self.model_version + 1}
+        ) as span:
             try:
-                kv = await self.js.key_value(self.model_bucket)
-            except Exception:
-                # Create bucket if it doesn't exist
-                kv = await self.js.create_key_value(
-                    bucket=self.model_bucket,
-                    history=1,  # Keep only latest version
-                    max_bytes=100 * 1024 * 1024  # 100MB limit
+                import torch
+                import io
+                
+                # Increment version
+                self.model_version += 1
+                
+                telem_logger.info(
+                    "Committing model",
+                    attributes={"version": self.model_version}
                 )
-            
-            # Serialize model state dict
-            buffer = io.BytesIO()
-            torch.save(model.network.state_dict(), buffer)
-            model_bytes = buffer.getvalue()
-            
-            model_size_mb = len(model_bytes) / (1024*1024)
-            logger.info(f"[Learner] Model size: {model_size_mb:.2f} MB")
-            
-            # For large models (>10MB), use chunked upload
-            if model_size_mb > 10:
-                logger.info(f"[Learner] Using chunked upload for large model")
-                chunk_size = 5 * 1024 * 1024  # 5MB chunks
-                num_chunks = (len(model_bytes) + chunk_size - 1) // chunk_size
                 
-                # Save number of chunks first
-                await kv.put(f"{self.model_key}_chunks", str(num_chunks).encode())
+                start_time = time.perf_counter()
                 
-                # Upload chunks
-                for i in range(num_chunks):
-                    start = i * chunk_size
-                    end = min(start + chunk_size, len(model_bytes))
-                    chunk = model_bytes[start:end]
-                    await kv.put(f"{self.model_key}_chunk_{i}", chunk)
-                    logger.info(f"[Learner] Uploaded chunk {i+1}/{num_chunks}")
-            else:
-                # Small model - direct upload
-                await kv.put(self.model_key, model_bytes)
-            
-            logger.info(f"[Learner] Model saved to NATS KV: {self.model_bucket}/{self.model_key}")
-            
-            # Notify swarm about new model
-            await self._notify_swarm_update()
-            
-        except Exception as e:
-            logger.error(f"[Learner] Failed to commit model: {e}")
-            raise
+                # Create or get KV bucket
+                try:
+                    kv = await self.js.key_value(self.model_bucket)
+                except Exception:
+                    # Create bucket if it doesn't exist
+                    kv = await self.js.create_key_value(
+                        bucket=self.model_bucket,
+                        history=1,  # Keep only latest version
+                        max_bytes=100 * 1024 * 1024  # 100MB limit
+                    )
+                
+                # Serialize model state dict
+                span.add_event("serializing_model")
+                serialize_start = time.perf_counter()
+                buffer = io.BytesIO()
+                torch.save(model.network.state_dict(), buffer)
+                model_bytes = buffer.getvalue()
+                serialize_duration = time.perf_counter() - serialize_start
+                
+                model_size_mb = len(model_bytes) / (1024*1024)
+                span.set_attribute("model_size_mb", model_size_mb)
+                
+                # For large models (>10MB), use chunked upload
+                if model_size_mb > 10:
+                    span.add_event("chunked_upload")
+                    upload_start = time.perf_counter()
+                    
+                    chunk_size = 5 * 1024 * 1024  # 5MB chunks
+                    num_chunks = (len(model_bytes) + chunk_size - 1) // chunk_size
+                    
+                    span.set_attribute("num_chunks", num_chunks)
+                    
+                    # Save number of chunks first
+                    await kv.put(f"{self.model_key}_chunks", str(num_chunks).encode())
+                    
+                    # Upload chunks
+                    for i in range(num_chunks):
+                        start = i * chunk_size
+                        end = min(start + chunk_size, len(model_bytes))
+                        chunk = model_bytes[start:end]
+                        await kv.put(f"{self.model_key}_chunk_{i}", chunk)
+                        telem_logger.debug(
+                            "Uploaded chunk",
+                            attributes={"chunk": i+1, "total": num_chunks}
+                        )
+                    
+                    upload_duration = time.perf_counter() - upload_start
+                else:
+                    # Small model - direct upload
+                    span.add_event("direct_upload")
+                    upload_start = time.perf_counter()
+                    await kv.put(self.model_key, model_bytes)
+                    upload_duration = time.perf_counter() - upload_start
+                
+                total_duration = time.perf_counter() - start_time
+                
+                # Record metrics
+                record_duration_metric("learner.model_serialize.duration", serialize_duration)
+                record_duration_metric("learner.model_upload.duration", upload_duration)
+                record_duration_metric("learner.model_commit.duration", total_duration)
+                record_value_metric("model.size_bytes", len(model_bytes), unit="bytes")
+                record_value_metric("model.version.current", self.model_version)
+                increment_counter_metric("learner.model_commits.total", 1)
+                
+                span.set_attribute("duration", total_duration)
+                
+                telem_logger.info(
+                    "Model committed to NATS KV",
+                    attributes={
+                        "version": self.model_version,
+                        "bucket": self.model_bucket,
+                        "key": self.model_key,
+                        "size_mb": model_size_mb,
+                        "duration_seconds": total_duration,
+                    }
+                )
+                
+                # Notify swarm about new model
+                await self._notify_swarm_update()
+                
+            except Exception as e:
+                telem_logger.error(f"Failed to commit model: {str(e)}")
+                increment_counter_metric("learner.model_commit.failures.total", 1)
+                raise
     
     async def _notify_swarm_update(self):
         """Send notification to swarm about new model version."""
-        try:
-            import json
-            
-            notification = {
-                "version": self.model_version,
-                "bucket": self.model_bucket,
-                "key": self.model_key
-            }
-            
-            await self.nc.publish(
-                self.model_update_subject,
-                json.dumps(notification).encode()
-            )
-            
-            logger.info(f"[Learner] Notified swarm about model v{self.model_version}")
-            
-        except Exception as e:
-            logger.error(f"[Learner] Failed to notify swarm: {e}")
+        with create_span(
+            "learner_node.notify_swarm",
+            tracer=tracer,
+            attributes={"version": self.model_version}
+        ) as span:
+            try:
+                import json
+                
+                notification = {
+                    "version": self.model_version,
+                    "bucket": self.model_bucket,
+                    "key": self.model_key
+                }
+                
+                await self.nc.publish(
+                    self.model_update_subject,
+                    json.dumps(notification).encode()
+                )
+                
+                increment_counter_metric("learner.swarm_notifications.total", 1)
+                
+                telem_logger.info(
+                    "Notified swarm about model update",
+                    attributes={"version": self.model_version}
+                )
+                
+            except Exception as e:
+                telem_logger.error(f"Failed to notify swarm: {str(e)}")
+                increment_counter_metric("learner.swarm_notification.failures.total", 1)

@@ -1,0 +1,39 @@
+# Simple OTEL Collector Config - Console Output Only
+# Perfect for quick testing and debugging
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 50
+
+exporters:
+  # Print everything to console (new debug exporter)
+  debug:
+    verbosity: detailed
+    sampling_initial: 5
+    sampling_thereafter: 10
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+    
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

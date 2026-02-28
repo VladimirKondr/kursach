@@ -1,0 +1,128 @@
+# SigNoz Observability Stack for IMPALA RL
+# Based on official SigNoz Docker Standalone setup
+# See: https://signoz.io/docs/install/docker/
+#
+# Usage:
+#   docker compose -f docker-compose.signoz.yml up -d --remove-orphans
+#   Access SigNoz UI at: http://localhost:3301
+#   OTLP endpoint: localhost:4317 (gRPC) or localhost:4318 (HTTP)
+#
+# To stop:
+#   docker compose -f docker-compose.signoz.yml down
+#
+# To stop and remove data:
+#   docker compose -f docker-compose.signoz.yml down -v
+
+x-clickhouse-defaults: &clickhouse-defaults
+  restart: on-failure
+  image: clickhouse/clickhouse-server:23.11-alpine
+  tty: true
+  logging:
+    options:
+      max-size: 50m
+      max-file: "3"
+  healthcheck:
+    test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+    interval: 30s
+    timeout: 5s
+    retries: 5
+    start_period: 30s
+  ulimits:
+    nproc: 65535
+    nofile:
+      soft: 262144
+      hard: 262144
+
+x-db-depend: &db-depend
+  depends_on:
+    clickhouse:
+      condition: service_healthy
+
+services:
+  clickhouse:
+    <<: *clickhouse-defaults
+    container_name: signoz-clickhouse
+    hostname: clickhouse
+    ports:
+      - "9000:9000"
+      - "8123:8123"
+    volumes:
+      - signoz-clickhouse-data:/var/lib/clickhouse/
+    environment:
+      - CLICKHOUSE_DB=signoz_traces
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+    networks:
+      - signoz
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.91.0
+    container_name: signoz-otel-collector
+    command: ["--config=/etc/otelcol-contrib/otel-collector-config.yaml"]
+    restart: on-failure
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/otel-collector-config.yaml
+    environment:
+      - OTEL_RESOURCE_ATTRIBUTES=host.name=signoz-host,os.type=linux
+    ports:
+      - "4317:4317"  # OTLP gRPC receiver
+      - "4318:4318"  # OTLP HTTP receiver
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "localhost:13133"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - signoz
+
+  query-service:
+    image: signoz/query-service:latest
+    container_name: signoz-query-service
+    command: ["-config=/root/config/prometheus.yml"]
+    volumes:
+      - ./prometheus.yml:/root/config/prometheus.yml
+      - signoz-query-service-data:/var/lib/signoz
+    environment:
+      - ClickHouseUrl=tcp://clickhouse:9000
+      - STORAGE=clickhouse
+      - GODEBUG=netdns=go
+      - TELEMETRY_ENABLED=true
+      - DEPLOYMENT_TYPE=docker-standalone-amd
+      - SIGNOZ_LOCAL_DB_PATH=/var/lib/signoz/signoz.db
+      - SIGNOZ_JWT_SECRET=my-secret-key-change-in-production
+    ports:
+      - "8080:8080"
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "localhost:8080/api/v1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    <<: *db-depend
+    networks:
+      - signoz
+
+  frontend:
+    image: signoz/frontend:latest
+    container_name: signoz-frontend
+    restart: on-failure
+    depends_on:
+      - query-service
+    ports:
+      - "3301:3301"
+    volumes:
+      - signoz-frontend-data:/var/lib/signoz-frontend
+    networks:
+      - signoz
+
+volumes:
+  signoz-clickhouse-data:
+  signoz-query-service-data:
+  signoz-frontend-data:
+
+networks:
+  signoz:
+    driver: bridge

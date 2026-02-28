@@ -1,0 +1,281 @@
+====================================================================================================
+IMPALA TRAINING RUN LOGS - Run ID: 1772308951_ed9db67b
+Generated: 2026-02-28 23:23:19.088693
+====================================================================================================
+
+📊 ALL METRICS FOR THIS RUN
+----------------------------------------------------------------------------------------------------
+Error: Received exception from server (version 25.5.6):
+Code: 47. DB::Exception: Received from localhost:9000. DB::Exception: Unknown expression identifier `attributes` in scope SELECT toDateTime(unix_milli / 1000) AS timestamp, metric_name, value, attributes FROM signoz_metrics.distributed_samples_v4 WHERE toDateTime(unix_milli / 1000) >= (now() - toIntervalHour(2)) ORDER BY timestamp ASC. (UNKNOWN_IDENTIFIER)
+(query: SELECT 
+          toDateTime(unix_milli/1000) as timestamp,
+          metric_name,
+          value,
+          attributes
+        FROM signoz_metrics.distributed_samples_v4
+        WHERE toDateTime(unix_milli/1000) >= now() - INTERVAL 2 HOUR
+        ORDER BY timestamp
+        FORMAT TabSeparatedWithNames
+        )
+
+
+📈 SUMMARY STATISTICS
+----------------------------------------------------------------------------------------------------
+Loss Statistics:
+26	87.74913024902344	10113.0400390625	3140.8312571598935
+
+
+Reward Statistics:
+660	0.4192505180835724	0.7100714445114136	0.5713722346858545
+
+
+SMILES Validity Statistics:
+660	0.8125	1	0.9871212121212121
+
+
+All Metrics Collected:
+actor.model_download.duration	109
+actor.model_download.duration.bucket	480
+actor.model_download.duration.count	30
+actor.model_download.duration.max	30
+actor.model_download.duration.min	30
+actor.model_download.duration.sum	30
+actor.model_load.duration	109
+actor.model_load.duration.bucket	480
+actor.model_load.duration.count	30
+actor.model_load.duration.max	30
+actor.model_load.duration.min	30
+actor.model_load.duration.sum	30
+actor.model_load.failures.total	139
+actor.reward.max	660
+actor.reward.max.bucket	1616
+actor.reward.max.count	101
+actor.reward.max.max	101
+actor.reward.max.min	101
+actor.reward.max.sum	101
+actor.reward.mean	660
+actor.reward.mean.bucket	1616
+actor.reward.mean.count	101
+actor.reward.mean.max	101
+actor.reward.mean.min	101
+actor.reward.mean.sum	101
+actor.reward.min	660
+actor.reward.min.bucket	1616
+actor.reward.min.count	101
+actor.reward.min.max	101
+actor.reward.min.min	101
+actor.reward.min.sum	101
+actor.reward.std.bucket	1616
+actor.reward.std.count	101
+actor.reward.std.max	101
+actor.reward.std.min	101
+actor.reward.std.sum	101
+actor.sampling.duration	138
+actor.sampling.duration.bucket	560
+actor.sampling.duration.count	35
+actor.sampling.duration.max	35
+actor.sampling.duration.min	35
+actor.sampling.duration.sum	35
+actor.scoring.duration	138
+actor.scoring.duration.bucket	560
+actor.scoring.duration.count	35
+actor.scoring.duration.max	35
+actor.scoring.duration.min	35
+actor.scoring.duration.sum	35
+actor.smiles.valid.ratio	660
+actor.smiles.valid.ratio.bucket	1616
+actor.smiles.valid.ratio.count	101
+actor.smiles.valid.ratio.max	101
+actor.smiles.valid.ratio.min	101
+actor.smiles.valid.ratio.sum	101
+actor.trajectories_generated.total	761
+actor.trajectory_generation.duration	660
+actor.trajectory_generation.duration.bucket	1616
+actor.trajectory_generation.duration.count	101
+actor.trajectory_generation.duration.max	101
+actor.trajectory_generation.duration.min	101
+actor.trajectory_generation.duration.sum	101
+exporter_db_write_latency.bucket	22912
+exporter_db_write_latency.count	1432
+exporter_db_write_latency.sum	1432
+exporter_prepare_metrics_duration.bucket	1648
+exporter_prepare_metrics_duration.count	103
+exporter_prepare_metrics_duration.sum	103
+learner.agent_nll.mean	26
+learner.agent_nll.mean.bucket	112
+learner.agent_nll.mean.count	7
+learner.agent_nll.mean.max	7
+learner.agent_nll.mean.min	7
+learner.agent_nll.mean.sum	7
+learner.batch.size	27
+learner.batch.size.bucket	112
+learner.batch.size.count	7
+learner.batch.size.max	7
+learner.batch.size.min	7
+learner.batch.size.sum	7
+learner.batch_collection.duration	27
+learner.batch_collection.duration.bucket	112
+learner.batch_collection.duration.count	7
+learner.batch_collection.duration.max	7
+learner.batch_collection.duration.min	7
+learner.batch_collection.duration.sum	7
+learner.compute_importance_weights.duration	26
+learner.compute_importance_weights.duration.bucket	112
+learner.compute_importance_weights.duration.count	7
+learner.compute_importance_weights.duration.max	7
+learner.compute_importance_weights.duration.min	7
+learner.compute_importance_weights.duration.sum	7
+learner.compute_target_log_probs.duration	26
+learner.compute_target_log_probs.duration.bucket	112
+learner.compute_target_log_probs.duration.count	7
+learner.compute_target_log_probs.duration.max	7
+learner.compute_target_log_probs.duration.min	7
+learner.compute_target_log_probs.duration.sum	7
+learner.get_trajectories.failures.total	2
+learner.importance_weight	126
+learner.importance_weights.max	26
+learner.importance_weights.max.bucket	112
+learner.importance_weights.max.count	7
+learner.importance_weights.max.max	7
+learner.importance_weights.max.min	7
+learner.importance_weights.max.sum	7
+learner.importance_weights.mean	26
+learner.importance_weights.mean.bucket	112
+learner.importance_weights.mean.count	7
+learner.importance_weights.mean.max	7
+learner.importance_weights.mean.min	7
+learner.importance_weights.mean.sum	7
+learner.importance_weights.min	26
+learner.loss	26
+learner.loss.bucket	112
+learner.loss.count	7
+learner.loss.max	7
+learner.loss.min	7
+learner.loss.sum	7
+learner.model_commit.duration	26
+learner.model_commit.duration.bucket	112
+learner.model_commit.duration.count	7
+learner.model_commit.duration.max	7
+learner.model_commit.duration.min	7
+learner.model_commit.duration.sum	7
+learner.model_commits.total	33
+learner.model_serialize.duration	26
+learner.model_serialize.duration.bucket	112
+learner.model_serialize.duration.count	7
+learner.model_serialize.duration.max	7
+learner.model_serialize.duration.min	7
+learner.model_serialize.duration.sum	7
+learner.model_upload.duration	26
+learner.model_upload.duration.bucket	112
+learner.model_upload.duration.count	7
+learner.model_upload.duration.max	7
+learner.model_upload.duration.min	7
+learner.model_upload.duration.sum	7
+learner.prior_nll.mean	26
+learner.prior_nll.mean.bucket	112
+learner.prior_nll.mean.count	7
+learner.prior_nll.mean.max	7
+learner.prior_nll.mean.min	7
+learner.prior_nll.mean.sum	7
+learner.swarm_notifications.total	33
+learner.trajectories_fetched.total	34
+learner.update.duration	26
+learner.update.duration.bucket	112
+learner.update.duration.count	7
+learner.update.duration.max	7
+learner.update.duration.min	7
+learner.update.duration.sum	7
+model.size_bytes	135
+model.size_bytes.bucket	592
+model.size_bytes.count	37
+model.size_bytes.max	37
+model.size_bytes.min	37
+model.size_bytes.sum	37
+model.version.current	135
+model.version.current.bucket	592
+model.version.current.count	37
+model.version.current.max	37
+model.version.current.min	37
+model.version.current.sum	37
+nats.connection.state	210
+nats.fetch.duration	27
+nats.fetch.duration.bucket	112
+nats.fetch.duration.count	7
+nats.fetch.duration.max	7
+nats.fetch.duration.min	7
+nats.fetch.duration.sum	7
+nats.fetch.timeouts.total	6
+nats.message.size_bytes	135
+nats.message.size_bytes.bucket	560
+nats.message.size_bytes.count	35
+nats.message.size_bytes.max	35
+nats.message.size_bytes.min	35
+nats.message.size_bytes.sum	35
+nats.message.total_size_bytes	27
+nats.message.total_size_bytes.bucket	112
+nats.message.total_size_bytes.count	7
+nats.message.total_size_bytes.max	7
+nats.message.total_size_bytes.min	7
+nats.message.total_size_bytes.sum	7
+nats.publish.duration	135
+nats.publish.duration.bucket	560
+nats.publish.duration.count	35
+nats.publish.duration.max	35
+nats.publish.duration.min	35
+nats.publish.duration.sum	35
+nats.publish.failures.total	110
+nats.publish.total	170
+nats.queue.depth	27
+nats.queue.depth.bucket	112
+nats.queue.depth.count	7
+nats.queue.depth.max	7
+nats.queue.depth.min	7
+nats.queue.depth.sum	7
+nats.serialize.duration	135
+nats.serialize.duration.bucket	560
+nats.serialize.duration.count	35
+nats.serialize.duration.max	35
+nats.serialize.duration.min	35
+nats.serialize.duration.sum	35
+otelcol_connector.produced.items.count	44
+otelcol_connector.received.items.count	307
+otelcol_exporter_queue_capacity	624
+otelcol_exporter_queue_size	624
+otelcol_exporter_send_failed_log_records	204
+otelcol_exporter_send_failed_metric_points	250
+otelcol_exporter_send_failed_spans	204
+otelcol_exporter_sent_log_records	204
+otelcol_exporter_sent_metric_points	250
+otelcol_exporter_sent_spans	204
+otelcol_process_cpu_seconds	104
+otelcol_process_memory_rss	104
+otelcol_process_runtime_heap_alloc_bytes	104
+otelcol_process_runtime_total_alloc_bytes	104
+otelcol_process_runtime_total_sys_memory_bytes	104
+otelcol_process_uptime	104
+otelcol_processor_batch_batch_send_size.bucket	3381
+otelcol_processor_batch_batch_send_size.count	147
+otelcol_processor_batch_batch_send_size.sum	147
+otelcol_processor_batch_metadata_cardinality	208
+otelcol_processor_batch_timeout_trigger_send	147
+otelcol_receiver_accepted_log_records	102
+otelcol_receiver_accepted_metric_points	205
+otelcol_receiver_accepted_spans	102
+otelcol_receiver_failed_log_records	102
+otelcol_receiver_failed_metric_points	205
+otelcol_receiver_failed_spans	102
+otelcol_receiver_refused_log_records	102
+otelcol_receiver_refused_metric_points	205
+otelcol_receiver_refused_spans	102
+promhttp_metric_handler_errors_total	208
+scrape_duration_seconds	104
+scrape_samples_post_metric_relabeling	104
+scrape_samples_scraped	104
+scrape_series_added	104
+signoz_calls_total	214
+signoz_latency.bucket	3852
+signoz_latency.count	214
+signoz_latency.sum	214
+up	104
+
+

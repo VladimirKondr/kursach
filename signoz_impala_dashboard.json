@@ -1,0 +1,255 @@
+{
+  "title": "IMPALA Training Dashboard",
+  "description": "Complete monitoring dashboard for IMPALA Reinforcement Learning training",
+  "tags": ["impala", "reinforcement-learning", "training"],
+  "layout": [
+    {
+      "i": "loss-panel",
+      "x": 0,
+      "y": 0,
+      "w": 12,
+      "h": 4
+    },
+    {
+      "i": "reward-panel",
+      "x": 0,
+      "y": 4,
+      "w": 12,
+      "h": 4
+    },
+    {
+      "i": "validity-panel",
+      "x": 0,
+      "y": 8,
+      "w": 6,
+      "h": 3
+    },
+    {
+      "i": "importance-weights-panel",
+      "x": 6,
+      "y": 8,
+      "w": 6,
+      "h": 3
+    },
+    {
+      "i": "model-version-panel",
+      "x": 0,
+      "y": 11,
+      "w": 6,
+      "h": 3
+    },
+    {
+      "i": "queue-depth-panel",
+      "x": 6,
+      "y": 11,
+      "w": 6,
+      "h": 3
+    },
+    {
+      "i": "durations-panel",
+      "x": 0,
+      "y": 14,
+      "w": 12,
+      "h": 4
+    },
+    {
+      "i": "per-actor-importance-panel",
+      "x": 0,
+      "y": 18,
+      "w": 12,
+      "h": 4
+    }
+  ],
+  "panels": [
+    {
+      "id": "loss-panel",
+      "title": "🎯 Training Loss (Lower is Better)",
+      "description": "Main training loss - should decrease over time if model is learning",
+      "panelTypes": "TIME_SERIES",
+      "query": {
+        "queryType": "clickhouse_sql",
+        "clickhouse_sql": [
+          {
+            "name": "Learner Loss",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as loss FROM distributed_samples_v4 WHERE metric_name='learner.loss' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          }
+        ]
+      },
+      "visualizationOptions": {
+        "chartType": "line",
+        "yAxisLabel": "Loss",
+        "showLegend": true
+      }
+    },
+    {
+      "id": "reward-panel",
+      "title": "🎁 Rewards (Mean/Min/Max by Actor)",
+      "description": "Reward statistics per actor - should increase over time",
+      "panelTypes": "TIME_SERIES",
+      "query": {
+        "queryType": "clickhouse_sql",
+        "clickhouse_sql": [
+          {
+            "name": "Mean Reward (Actor {{actor_id}})",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as reward, attributes['actor_id'] as actor_id FROM distributed_samples_v4 WHERE metric_name='actor.reward.mean' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          },
+          {
+            "name": "Max Reward",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as reward FROM distributed_samples_v4 WHERE metric_name='actor.reward.max' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          },
+          {
+            "name": "Min Reward",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as reward FROM distributed_samples_v4 WHERE metric_name='actor.reward.min' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          }
+        ]
+      },
+      "visualizationOptions": {
+        "chartType": "line",
+        "yAxisLabel": "Reward",
+        "showLegend": true
+      }
+    },
+    {
+      "id": "validity-panel",
+      "title": "✅ SMILES Validity Ratio",
+      "description": "Percentage of valid molecules generated (should stay high ~0.95+)",
+      "panelTypes": "TIME_SERIES",
+      "query": {
+        "queryType": "clickhouse_sql",
+        "clickhouse_sql": [
+          {
+            "name": "Validity Ratio (Actor {{actor_id}})",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value * 100 as validity_percent, attributes['actor_id'] as actor_id FROM distributed_samples_v4 WHERE metric_name='actor.smiles.valid.ratio' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          }
+        ]
+      },
+      "visualizationOptions": {
+        "chartType": "line",
+        "yAxisLabel": "Valid %",
+        "showLegend": true,
+        "yMin": 0,
+        "yMax": 100
+      }
+    },
+    {
+      "id": "importance-weights-panel",
+      "title": "⚖️ Importance Weights (Aggregate)",
+      "description": "V-trace importance weights - Mean should be ~1.0, check Min for problematic actors",
+      "panelTypes": "TIME_SERIES",
+      "query": {
+        "queryType": "clickhouse_sql",
+        "clickhouse_sql": [
+          {
+            "name": "Mean Weight",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as weight FROM distributed_samples_v4 WHERE metric_name='learner.importance_weights.mean' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          },
+          {
+            "name": "Min Weight (⚠️ Watch this)",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as weight FROM distributed_samples_v4 WHERE metric_name='learner.importance_weights.min' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          },
+          {
+            "name": "Max Weight",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as weight FROM distributed_samples_v4 WHERE metric_name='learner.importance_weights.max' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          }
+        ]
+      },
+      "visualizationOptions": {
+        "chartType": "line",
+        "yAxisLabel": "Weight",
+        "showLegend": true
+      }
+    },
+    {
+      "id": "per-actor-importance-panel",
+      "title": "⚖️ Importance Weights Per Actor (Detect Lagging Actors)",
+      "description": "Individual importance weights by actor - if one actor consistently low, its policy is too outdated",
+      "panelTypes": "TIME_SERIES",
+      "query": {
+        "queryType": "clickhouse_sql",
+        "clickhouse_sql": [
+          {
+            "name": "Actor {{actor_id}} Weight",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as weight, attributes['actor_id'] as actor_id FROM distributed_samples_v4 WHERE metric_name='learner.importance_weight' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          }
+        ]
+      },
+      "visualizationOptions": {
+        "chartType": "line",
+        "yAxisLabel": "Weight",
+        "showLegend": true
+      }
+    },
+    {
+      "id": "model-version-panel",
+      "title": "🔄 Model Version Lag",
+      "description": "How many versions behind each actor is from latest model (should stay low <5)",
+      "panelTypes": "TIME_SERIES",
+      "query": {
+        "queryType": "clickhouse_sql",
+        "clickhouse_sql": [
+          {
+            "name": "Version Lag (Actor {{actor_id}})",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as lag, attributes['actor_id'] as actor_id FROM distributed_samples_v4 WHERE metric_name='model.version.lag' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          }
+        ]
+      },
+      "visualizationOptions": {
+        "chartType": "line",
+        "yAxisLabel": "Versions Behind",
+        "showLegend": true
+      }
+    },
+    {
+      "id": "queue-depth-panel",
+      "title": "📦 NATS Queue Depth",
+      "description": "Number of trajectories waiting to be processed (high = actors too fast, learner bottleneck)",
+      "panelTypes": "TIME_SERIES",
+      "query": {
+        "queryType": "clickhouse_sql",
+        "clickhouse_sql": [
+          {
+            "name": "Queue Depth",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as depth FROM distributed_samples_v4 WHERE metric_name='nats.queue.depth' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          }
+        ]
+      },
+      "visualizationOptions": {
+        "chartType": "line",
+        "yAxisLabel": "Messages in Queue",
+        "showLegend": true
+      }
+    },
+    {
+      "id": "durations-panel",
+      "title": "⏱️ Operation Durations",
+      "description": "Time taken for key operations",
+      "panelTypes": "TIME_SERIES",
+      "query": {
+        "queryType": "clickhouse_sql",
+        "clickhouse_sql": [
+          {
+            "name": "Learner Update",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as duration FROM distributed_samples_v4 WHERE metric_name='learner.update.duration' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          },
+          {
+            "name": "Actor Trajectory Gen",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as duration FROM distributed_samples_v4 WHERE metric_name='actor.trajectory_generation.duration' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          },
+          {
+            "name": "Actor Sampling",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as duration FROM distributed_samples_v4 WHERE metric_name='actor.sampling.duration' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          },
+          {
+            "name": "Actor Scoring",
+            "query": "SELECT toDateTime(unix_milli/1000) as time, value as duration FROM distributed_samples_v4 WHERE metric_name='actor.scoring.duration' AND time >= now() - INTERVAL 1 HOUR ORDER BY time"
+          }
+        ]
+      },
+      "visualizationOptions": {
+        "chartType": "line",
+        "yAxisLabel": "Duration (seconds)",
+        "showLegend": true
+      }
+    }
+  ]
+}

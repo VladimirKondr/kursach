@@ -1,0 +1,47 @@
+# Telemetry Configuration for Production Environment
+# Optimized for production with reduced sampling and INFO+ logging
+
+service:
+  name: reinvent-impala
+  version: "1.0.0"
+  environment: prod
+
+traces:
+  enabled: true
+  exporter:
+    type: otlp
+    # Production endpoint - override with OTEL_EXPORTER_OTLP_ENDPOINT env var
+    endpoint: http://signoz-collector:4317
+    insecure: false  # Use TLS in production
+    headers: {}
+    timeout_seconds: 10
+  sampling:
+    type: parent_based  # Respect parent sampling decision
+    ratio: 0.1  # 10% sampling to reduce volume
+  resource_attributes:
+    deployment.environment: production
+    service.namespace: impala-rl
+
+metrics:
+  enabled: true
+  exporter:
+    type: otlp
+    endpoint: http://signoz-collector:4317
+    insecure: false
+    headers: {}
+    timeout_seconds: 10
+  interval_seconds: 60  # Export metrics every 60 seconds
+  views:
+    histogram_boundaries: [0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+
+logs:
+  enabled: true
+  level: INFO  # Only INFO and above in production
+  format: json
+  exporter:
+    type: otlp
+    endpoint: http://signoz-collector:4317
+    insecure: false
+    headers: {}
+    timeout_seconds: 10
+  include_trace_context: true

@@ -1,0 +1,20 @@
+# Prometheus configuration for SigNoz Query Service
+global:
+  scrape_interval: 60s
+  evaluation_interval: 60s
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# Load rules once and periodically evaluate them
+rule_files: []
+
+# Scrape configuration
+scrape_configs:
+  # Query service self-monitoring
+  - job_name: 'query-service'
+    static_configs:
+      - targets: ['localhost:8080']

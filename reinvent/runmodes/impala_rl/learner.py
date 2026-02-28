@@ -20,7 +20,17 @@ from reinvent.models.model_factory.sample_batch import SampleBatch
 if TYPE_CHECKING:
     from reinvent.runmodes.RL import terminator_callable
 
+# Telemetry imports
+from reinvent.runmodes.impala_rl.telemetry import get_tracer, get_logger
+from reinvent.runmodes.impala_rl.telemetry.traces import create_span
+from reinvent.runmodes.impala_rl.telemetry.metrics import (
+    record_duration_metric,
+    record_value_metric,
+)
+
 logger = logging.getLogger(__name__)
+telem_logger = get_logger(__name__)
+tracer = get_tracer(__name__)
 
 class ImpalaLearner(ReinventLearning):
     def subscribe(self, learner_node: LearnerNode):
@@ -56,84 +66,114 @@ class ImpalaLearner(ReinventLearning):
         Returns:
             Tuple of (agent_lls, prior_lls, augmented_nll, loss)
         """
-        # 1. Compute NLLs for current agent and prior policies
-        agent_nlls = self._state.agent.likelihood_smiles(self.sampled.items2)
-        prior_nlls = self.prior.likelihood_smiles(self.sampled.items2)
-        
-        # 2. Compute target log probs for each trajectory (using current agent model)
-        self._compute_target_log_probs()
-        
-        # 3. Compute V-trace importance weights for off-policy correction
-        importance_weights = self._compute_importance_weights()
-        
-        # 5. Call reward strategy with weighted scores
-        valid_mask = np.argwhere(self.sampled.states == SmilesState.VALID).flatten()
-
-        orig_smilies = orig_smilies
-        scores = results.total_scores
-        agent_nlls = agent_nlls
-        prior_nlls = prior_nlls
-        mask_idx = valid_mask
-        agent = self._state.agent
-
-        self._strategy: Callable = dap_strategy
-        self._sigma = 120
-
-        ### FROM RLReward.__call__()
-        scores = torch.from_numpy(scores).to(prior_nlls)
-
-        # FIXME: move NaN filtering before first use of scores in learning
-        # FIXME: reconsider NaN/failure handling
-        nan_idx = torch.isnan(scores)
-        scores_nonnan = scores[~nan_idx]
-        agent_lls = -agent_nlls[~nan_idx]  # negated because we need to minimize
-        prior_lls = -prior_nlls[~nan_idx]
-        importance_weights = importance_weights[~nan_idx]
-
-        loss, augmented_lls = self._strategy(
-            agent_lls,
-            scores_nonnan,
-            prior_lls,
-            self._sigma,
-        )
-
-        loss = loss * importance_weights.detach()
-
-        if self.inception is not None:
-            inception_result = self.inception(
-                np.array(orig_smilies)[mask_idx], scores_nonnan[mask_idx], prior_lls[mask_idx]
-            )
+        with create_span("learner.update", tracer=tracer) as span:
+            update_start = time.perf_counter()
             
-            # Check if inception returned valid data (may be None if memory is empty)
-            if inception_result is not None:
-                _orig_smilies, _scores, _prior_lls = inception_result
+            # 1. Compute NLLs for current agent and prior policies
+            span.add_event("computing_likelihoods")
+            agent_nlls = self._state.agent.likelihood_smiles(self.sampled.items2)
+            prior_nlls = self.prior.likelihood_smiles(self.sampled.items2)
+            
+            # 2. Compute target log probs for each trajectory (using current agent model)
+            span.add_event("computing_target_log_probs")
+            self._compute_target_log_probs()
+            
+            # 3. Compute V-trace importance weights for off-policy correction
+            span.add_event("computing_importance_weights")
+            importance_weights = self._compute_importance_weights()
+            
+            # 5. Call reward strategy with weighted scores
+            valid_mask = np.argwhere(self.sampled.states == SmilesState.VALID).flatten()
 
-                # compute the agent NLLs for the _current_ state of the agent
-                lls = agent.likelihood_smiles(_orig_smilies)
+            orig_smilies = orig_smilies
+            scores = results.total_scores
+            agent_nlls = agent_nlls
+            prior_nlls = prior_nlls
+            mask_idx = valid_mask
+            agent = self._state.agent
 
-                if isinstance(lls, torch.Tensor):  # Reinvent
-                    _agent_lls = -lls
-                else:  # all other models
-                    _agent_lls = -lls.likelihood
+            self._strategy: Callable = dap_strategy
+            self._sigma = 120
 
-                inception_loss, _ = self._strategy(
-                    _agent_lls,
-                    torch.tensor(_scores).to(_agent_lls),
-                    torch.tensor(_prior_lls).to(_agent_lls),
-                    self._sigma,
+            ### FROM RLReward.__call__()
+            scores = torch.from_numpy(scores).to(prior_nlls)
+
+            # FIXME: move NaN filtering before first use of scores in learning
+            # FIXME: reconsider NaN/failure handling
+            nan_idx = torch.isnan(scores)
+            scores_nonnan = scores[~nan_idx]
+            agent_lls = -agent_nlls[~nan_idx]  # negated because we need to minimize
+            prior_lls = -prior_nlls[~nan_idx]
+            importance_weights = importance_weights[~nan_idx]
+
+            loss, augmented_lls = self._strategy(
+                agent_lls,
+                scores_nonnan,
+                prior_lls,
+                self._sigma,
+            )
+
+            loss = loss * importance_weights.detach()
+
+            if self.inception is not None:
+                inception_result = self.inception(
+                    np.array(orig_smilies)[mask_idx], scores_nonnan[mask_idx], prior_lls[mask_idx]
                 )
+                
+                # Check if inception returned valid data (may be None if memory is empty)
+                if inception_result is not None:
+                    _orig_smilies, _scores, _prior_lls = inception_result
 
-                loss = torch.cat((loss, inception_loss), 0)
+                    # compute the agent NLLs for the _current_ state of the agent
+                    lls = agent.likelihood_smiles(_orig_smilies)
 
-        loss = loss.mean()
-        
-        self.reward_nlls._optimizer.zero_grad()
-        loss.backward()
-        self.reward_nlls._optimizer.step()
+                    if isinstance(lls, torch.Tensor):  # Reinvent
+                        _agent_lls = -lls
+                    else:  # all other models
+                        _agent_lls = -lls.likelihood
 
-        ### FROM RLReward.__call__()
+                    inception_loss, _ = self._strategy(
+                        _agent_lls,
+                        torch.tensor(_scores).to(_agent_lls),
+                        torch.tensor(_prior_lls).to(_agent_lls),
+                        self._sigma,
+                    )
 
-        return agent_lls, prior_lls, augmented_lls, loss
+                    loss = torch.cat((loss, inception_loss), 0)
+
+            loss = loss.mean()
+            
+            span.add_event("backward_pass")
+            self.reward_nlls._optimizer.zero_grad()
+            loss.backward()
+            self.reward_nlls._optimizer.step()
+
+            ### FROM RLReward.__call__()
+            
+            # Record metrics
+            update_duration = time.perf_counter() - update_start
+            record_duration_metric("learner.update.duration", update_duration)
+            record_value_metric("learner.loss", float(loss.item()))
+            record_value_metric("learner.agent_nll.mean", float(agent_nlls.mean().item()))
+            record_value_metric("learner.prior_nll.mean", float(prior_nlls.mean().item()))
+            
+            # Record per-actor importance weights for monitoring individual actors
+            for traj, weight in zip(self.trajectories, importance_weights):
+                record_value_metric(
+                    "learner.importance_weight",
+                    float(weight.item()),
+                    attributes={"actor_id": traj.actor_id}
+                )
+            
+            # Record aggregate importance weight statistics
+            record_value_metric("learner.importance_weights.mean", float(importance_weights.mean().item()))
+            record_value_metric("learner.importance_weights.min", float(importance_weights.min().item()))
+            record_value_metric("learner.importance_weights.max", float(importance_weights.max().item()))
+            
+            span.set_attribute("loss", float(loss.item()))
+            span.set_attribute("batch_size", len(agent_nlls))
+
+            return agent_lls, prior_lls, augmented_lls, loss
     
     def _compute_target_log_probs(self):
         """Compute target policy log probabilities for each trajectory.
@@ -141,12 +181,19 @@ class ImpalaLearner(ReinventLearning):
         Uses current agent model to compute log probs for each token in sequences.
         Stores results in trajectory.target_log_prob field.
         """
-        for traj in self.trajectories:
-            # Use agent model to compute log probs for this sequence
-            # Delegate to model's method for computing token-level log probs
-            target_log_probs = self._state.agent.model._compute_token_log_probs(traj.sequence)
-            traj.target_log_prob = target_log_probs
-            traj.target_nll = -target_log_probs.sum()
+        with create_span("learner.compute_target_log_probs", tracer=tracer) as span:
+            start_time = time.perf_counter()
+            
+            for traj in self.trajectories:
+                # Use agent model to compute log probs for this sequence
+                # Delegate to model's method for computing token-level log probs
+                target_log_probs = self._state.agent.model._compute_token_log_probs(traj.sequence)
+                traj.target_log_prob = target_log_probs
+                traj.target_nll = -target_log_probs.sum()
+            
+            duration = time.perf_counter() - start_time
+            record_duration_metric("learner.compute_target_log_probs.duration", duration)
+            span.set_attribute("num_trajectories", len(self.trajectories))
     
     def _compute_importance_weights(self, clip_rho=10.0, normalize=True):
         """Compute importance weights for off-policy correction using Clipped IS.
@@ -166,42 +213,51 @@ class ImpalaLearner(ReinventLearning):
         Returns:
             Tensor of importance weights [batch_size]
         """
-        log_ratios = []
-        
-        for i, traj in enumerate(self.trajectories):
-            if traj.target_log_prob is None:
-                raise ValueError("Trajectory missing target_log_prob. Call _compute_target_log_probs first.")
+        with create_span("learner.compute_importance_weights", tracer=tracer) as span:
+            start_time = time.perf_counter()
             
-            # Compute importance ratio for entire trajectory
-            target_log_prob_sum = traj.target_log_prob.sum()
-            behavior_log_prob_sum = traj.behavior_log_prob.sum()
-            log_ratio = target_log_prob_sum - behavior_log_prob_sum
-            log_ratios.append(log_ratio)
-        
-        # Convert log ratios to tensor for stable computation
-        log_ratios = torch.stack(log_ratios)
-        
-        # For numerical stability, use log-sum-exp trick
-        # w = exp(log_ratio - max(log_ratios)) to avoid overflow/underflow
-        max_log_ratio = log_ratios.max()
-        importance_ratios = torch.exp(log_ratios - max_log_ratio)
-        
-        # Clip importance weights
-        clipped_weights = torch.clamp(importance_ratios, min=0.0, max=clip_rho)
-        
-        # Normalize weights if requested
-        if normalize:
-            weight_sum = clipped_weights.sum()
-            if weight_sum > 0:
-                normalized_weights = clipped_weights / weight_sum * len(clipped_weights)
+            log_ratios = []
+            
+            for i, traj in enumerate(self.trajectories):
+                if traj.target_log_prob is None:
+                    raise ValueError("Trajectory missing target_log_prob. Call _compute_target_log_probs first.")
+                
+                # Compute importance ratio for entire trajectory
+                target_log_prob_sum = traj.target_log_prob.sum()
+                behavior_log_prob_sum = traj.behavior_log_prob.sum()
+                log_ratio = target_log_prob_sum - behavior_log_prob_sum
+                log_ratios.append(log_ratio)
+            
+            # Convert log ratios to tensor for stable computation
+            log_ratios = torch.stack(log_ratios)
+            
+            # For numerical stability, use log-sum-exp trick
+            # w = exp(log_ratio - max(log_ratios)) to avoid overflow/underflow
+            max_log_ratio = log_ratios.max()
+            importance_ratios = torch.exp(log_ratios - max_log_ratio)
+            
+            # Clip importance weights
+            clipped_weights = torch.clamp(importance_ratios, min=0.0, max=clip_rho)
+            
+            # Normalize weights if requested
+            if normalize:
+                weight_sum = clipped_weights.sum()
+                if weight_sum > 0:
+                    normalized_weights = clipped_weights / weight_sum * len(clipped_weights)
+                else:
+                    # If all weights are zero, use uniform weights
+                    normalized_weights = torch.ones_like(clipped_weights)
+                weights_final = normalized_weights
             else:
-                # If all weights are zero, use uniform weights
-                normalized_weights = torch.ones_like(clipped_weights)
-            weights_final = normalized_weights
-        else:
-            weights_final = clipped_weights
-        
-        return weights_final.to(self._state.agent.device)
+                weights_final = clipped_weights
+            
+            duration = time.perf_counter() - start_time
+            record_duration_metric("learner.compute_importance_weights.duration", duration)
+            span.set_attribute("num_weights", len(weights_final))
+            span.set_attribute("clip_rho", clip_rho)
+            span.set_attribute("normalize", normalize)
+            
+            return weights_final.to(self._state.agent.device)
 
     def optimize(self, converged: terminator_callable) -> bool:
         step = -1

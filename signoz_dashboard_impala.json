@@ -1,0 +1,30 @@
+{
+  "title": "IMPALA Training Monitor",
+  "description": "Real-time monitoring of IMPALA reinforcement learning training",
+  "tags": ["impala", "training", "ml"],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Learner Loss (Average per Update)",
+      "type": "timeseries",
+      "query": "SELECT time, avg_loss FROM (SELECT toDateTime(unix_milli / 1000) as time, round((argMaxIf(value, unix_milli, metric_name = 'learner.loss.sum') - lagInFrame(argMaxIf(value, unix_milli, metric_name = 'learner.loss.sum'), 1, 0) OVER (ORDER BY unix_milli)) / nullIf(argMaxIf(value, unix_milli, metric_name = 'learner.loss.count') - lagInFrame(argMaxIf(value, unix_milli, metric_name = 'learner.loss.count'), 1, 0) OVER (ORDER BY unix_milli), 0), 2) as avg_loss FROM signoz_metrics.samples_v4 WHERE metric_name IN ('learner.loss.sum', 'learner.loss.count') AND unix_milli >= toUnixTimestamp(now() - INTERVAL 1 HOUR) * 1000 GROUP BY unix_milli) WHERE avg_loss IS NOT NULL AND avg_loss > 0 ORDER BY time",
+      "position": {"x": 0, "y": 0, "w": 12, "h": 8}
+    },
+    {
+      "id": 2,
+      "title": "Actor Mean Reward",
+      "type": "timeseries",
+      "query": "SELECT time, avg_reward FROM (SELECT toDateTime(unix_milli / 1000) as time, round((argMaxIf(value, unix_milli, metric_name = 'actor.reward.mean.sum') - lagInFrame(argMaxIf(value, unix_milli, metric_name = 'actor.reward.mean.sum'), 1, 0) OVER (ORDER BY unix_milli)) / nullIf(argMaxIf(value, unix_milli, metric_name = 'actor.reward.mean.count') - lagInFrame(argMaxIf(value, unix_milli, metric_name = 'actor.reward.mean.count'), 1, 0) OVER (ORDER BY unix_milli), 0), 4) as avg_reward FROM signoz_metrics.samples_v4 WHERE metric_name IN ('actor.reward.mean.sum', 'actor.reward.mean.count') AND unix_milli >= toUnixTimestamp(now() - INTERVAL 1 HOUR) * 1000 GROUP BY unix_milli) WHERE avg_reward IS NOT NULL ORDER BY time",
+      "position": {"x": 12, "y": 0, "w": 12, "h": 8}
+    },
+    {
+      "id": 3,
+      "title": "SMILES Validity Ratio",
+      "type": "timeseries",
+      "query": "SELECT time, validity FROM (SELECT toDateTime(unix_milli / 1000) as time, round((argMaxIf(value, unix_milli, metric_name = 'actor.smiles.valid.ratio.sum') - lagInFrame(argMaxIf(value, unix_milli, metric_name = 'actor.smiles.valid.ratio.sum'), 1, 0) OVER (ORDER BY unix_milli)) / nullIf(argMaxIf(value, unix_milli, metric_name = 'actor.smiles.valid.ratio.count') - lagInFrame(argMaxIf(value, unix_milli, metric_name = 'actor.smiles.valid.ratio.count'), 1, 0) OVER (ORDER BY unix_milli), 0), 4) as validity FROM signoz_metrics.samples_v4 WHERE metric_name IN ('actor.smiles.valid.ratio.sum', 'actor.smiles.valid.ratio.count') AND unix_milli >= toUnixTimestamp(now() - INTERVAL 1 HOUR) * 1000 GROUP BY unix_milli) WHERE validity IS NOT NULL AND validity >= 0 AND validity <= 1 ORDER BY time",
+      "position": {"x": 0, "y": 8, "w": 12, "h": 8}
+    }
+  ],
+  "refresh": "10s",
+  "time_range": "Last 1 hour"
+}
