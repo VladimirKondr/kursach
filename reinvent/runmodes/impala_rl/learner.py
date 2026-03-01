@@ -94,7 +94,9 @@ class ImpalaLearner(ReinventLearning):
             agent = self._state.agent
 
             self._strategy: Callable = dap_strategy
-            self._sigma = 120
+            # Use the sigma configured via reward_nlls (e.g. sigma=80), NOT a
+            # hardcoded 120 that overrides the caller's configuration every step.
+            self._sigma = self.reward_nlls._sigma
 
             ### FROM RLReward.__call__()
             scores = torch.from_numpy(scores).to(prior_nlls)
@@ -103,6 +105,16 @@ class ImpalaLearner(ReinventLearning):
             # FIXME: reconsider NaN/failure handling
             nan_idx = torch.isnan(scores)
             scores_nonnan = scores[~nan_idx]
+
+            # Normalize scores within the batch to zero mean and unit std.
+            # Without this, a batch where QED spans [0.1, 0.9] produces a
+            # σ·score range of 40 nats, driving large loss spikes regardless
+            # of LR.  Normalizing makes the gradient magnitude depend only on
+            # how far the agent is from the augmented target, not on the
+            # absolute score spread of this particular batch.
+            if scores_nonnan.std() > 1e-6:
+                scores_nonnan = (scores_nonnan - scores_nonnan.mean()) / (scores_nonnan.std() + 1e-8)
+
             agent_lls = -agent_nlls[~nan_idx]  # negated because we need to minimize
             prior_lls = -prior_nlls[~nan_idx]
             importance_weights = importance_weights[~nan_idx]
@@ -200,7 +212,7 @@ class ImpalaLearner(ReinventLearning):
             record_duration_metric("learner.compute_target_log_probs.duration", duration)
             span.set_attribute("num_trajectories", len(self.trajectories))
     
-    def _compute_importance_weights(self, clip_rho=5.0, normalize=True):
+    def _compute_importance_weights(self, clip_rho=2.0, normalize=True):
         """Compute importance weights for off-policy correction using Clipped IS.
         
         Clipped Importance Sampling (V-trace style):
@@ -239,11 +251,16 @@ class ImpalaLearner(ReinventLearning):
             log_ratios = torch.stack(log_ratios)
             
             # Step 1: Clip in log-space BEFORE any numerical tricks.
-            # This is the actual V-trace IS clipping: w_i = min(clip_rho, ratio_i).
-            # Previous code applied log-sum-exp shift BEFORE clipping, which made
-            # clamp(max=clip_rho) a dead operation (all shifted values were ≤ 1.0).
+            # Symmetric clipping: clamp(log_ratio, [-log_rho, +log_rho])
+            # Upper clip: standard V-trace — prevents over-weighting fresh trajectories.
+            # Lower clip: CRITICAL for same-machine distributed setup.
+            #   Without it, very stale actors (3-5 versions behind) produce
+            #   log_ratio << 0 → IS weight → 0 → effective batch shrinks from 32
+            #   to ~5-8 trajectories → loss variance explodes.
+            #   Symmetric clipping keeps every trajectory's weight in [1/rho, rho],
+            #   so all 32 trajectories always contribute meaningfully.
             log_clip_rho = math.log(clip_rho)
-            clipped_log_ratios = torch.clamp(log_ratios, max=log_clip_rho)
+            clipped_log_ratios = torch.clamp(log_ratios, min=-log_clip_rho, max=log_clip_rho)
             
             # Step 2: Numerical stability for exp — subtract max of the CLIPPED ratios.
             # This shift cancels out during normalization, so it doesn't affect the result.

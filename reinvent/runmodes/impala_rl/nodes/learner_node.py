@@ -1,6 +1,8 @@
 import asyncio
+import collections
 import json
 import logging
+import random
 import time
 import io
 import torch
@@ -36,7 +38,8 @@ class LearnerNode:
         publish_sibject: str = "jobs.result",
         model_update_subject: str = "model.update",
         model_bucket: str = "models",
-        model_key: str = "current_model"
+        model_key: str = "current_model",
+        buffer_capacity: int = 2000,
     ):
         self.queue_url = queue_url
         self.publish_sibject = publish_sibject
@@ -50,6 +53,17 @@ class LearnerNode:
         self.nc = None
         self.js = None
 
+        # Replay buffer: всe поступающие траектории
+        # накапливаются здесь; лёрнер сэмплирует из него.
+        # maxlen=buffer_capacity гарантирует, что старые
+        # (слишком устаревшие) траектории вытесняются.
+        self._replay_buffer: collections.deque["Trajectory"] = collections.deque(
+            maxlen=buffer_capacity
+        )
+        # Сколько раз подряд GetTrajectories отдало выборку
+        # из буфера без получения новых данных из NATS.
+        # Когда это число достигает порога — очередь истощилась.
+        self.consecutive_nats_drains: int = 0
     async def Connect(self):
         with create_span("learner_node.connect", tracer=tracer) as _:
             try:
@@ -85,25 +99,30 @@ class LearnerNode:
         max_retries: int | None = None,
         min_trajectories: int = 1,
     ) -> list[Trajectory]:
-        """Fetch trajectories from NATS queue.
+        """Drain NATS into the replay buffer, then return a random sample.
 
-        Keeps pulling messages until at least ``min_trajectories`` trajectories
-        are accumulated, then returns the whole collected batch.  If the queue
-        goes quiet (``max_retries`` consecutive timeouts with still fewer than
-        ``min_trajectories`` collected) the method returns whatever has been
-        gathered so far (possibly empty).
+        All received trajectories are stored in ``self._replay_buffer``
+        (a bounded deque).  The method blocks until the buffer contains at
+        least ``min_trajectories`` items, then returns a random sample of
+        exactly ``min_trajectories`` trajectories **without removing them**
+        from the buffer (so every trajectory can be used multiple times by
+        future updates, consistent with the IMPALA off-policy design).
+
+        The method returns an empty list only when NATS has been silent for
+        ``max_retries`` consecutive timeouts **and** the buffer still has
+        fewer than ``min_trajectories`` items — i.e. the queue is truly
+        drained and we have nothing to train on.
 
         Args:
-            timeout:          Timeout in seconds for each individual fetch attempt.
-            batch_size:       Number of NATS messages to request per fetch call.
-            max_retries:      Max consecutive empty fetches before giving up
-                              (defaults to self.max_retries).
-            min_trajectories: Keep accumulating until this many trajectories are
-                              in hand.  Use 1 to preserve the original one-shot
-                              behaviour.
+            timeout:          Per-fetch NATS timeout in seconds.
+            batch_size:       Number of NATS messages requested per fetch call.
+            max_retries:      Consecutive timeouts tolerated while waiting for
+                              the buffer to fill (defaults to self.max_retries).
+            min_trajectories: Desired sample size returned to the caller.
 
         Returns:
-            List of Trajectory objects; empty list means the queue is drained.
+            Random sample of ``min_trajectories`` Trajectory objects,
+            or fewer if the queue is fully drained, or [] to signal stop.
         """
         effective_max_retries = self.max_retries if max_retries is None else max_retries
 
@@ -120,24 +139,27 @@ class LearnerNode:
                 telem_logger.error("No JetStream connection")
                 return []
 
-            accumulated: list[Trajectory] = []
             total_message_size = 0
             consecutive_empty = 0
             start_time = time.perf_counter()
 
-            while len(accumulated) < min_trajectories:
+            got_new_from_nats = False  # did this call receive any new NATS messages?
+
+            # Block until replay buffer has enough items or queue is drained.
+            while len(self._replay_buffer) < min_trajectories:
                 if consecutive_empty >= effective_max_retries:
-                    # Queue appears drained — return what we have (may be empty)
                     queue_depth = self.psub.pending_msgs if self.psub else 0
-                    if accumulated:
+                    buf_size = len(self._replay_buffer)
+                    if buf_size > 0:
+                        # Partial batch — still useful, return what we have.
                         telem_logger.info(
-                            "GetTrajectories: returning partial batch before drain",
-                            attributes={"num_trajectories": len(accumulated),
+                            "GetTrajectories: buffer has partial batch, returning",
+                            attributes={"buffer_size": buf_size,
                                         "min_trajectories": min_trajectories},
                         )
                     else:
                         telem_logger.error(
-                            "GetTrajectories ran out of retries",
+                            "GetTrajectories: queue drained and buffer empty",
                             attributes={"queue_depth": queue_depth,
                                         "max_retries": effective_max_retries},
                         )
@@ -149,12 +171,14 @@ class LearnerNode:
 
                 try:
                     span.add_event("fetching_messages",
-                                   {"accumulated": len(accumulated),
+                                   {"buffer_size": len(self._replay_buffer),
                                     "consecutive_empty": consecutive_empty})
                     msgs = await self.psub.fetch(batch_size, timeout=timeout)
 
-                    consecutive_empty = 0  # got at least one message — reset
+                    consecutive_empty = 0  # got messages — reset timeout counter
 
+                    got_new_from_nats = True
+                    new_count = 0
                     for msg in msgs:
                         headers = msg.header if hasattr(msg, "header") else None
                         _parent_context = extract_trace_context(headers)
@@ -163,18 +187,25 @@ class LearnerNode:
                         total_message_size += len(msg.data)
 
                         for traj_dict in data_list:
-                            accumulated.append(Trajectory.from_dict(traj_dict))
+                            self._replay_buffer.append(Trajectory.from_dict(traj_dict))
+                            new_count += 1
 
                         await msg.ack()
+
+                    telem_logger.debug(
+                        "GetTrajectories: added to buffer",
+                        attributes={"new": new_count,
+                                    "buffer_size": len(self._replay_buffer)},
+                    )
 
                 except nats.errors.TimeoutError:
                     consecutive_empty += 1
                     queue_depth = self.psub.pending_msgs if self.psub else 0
-                    telem_logger.warning(
+                    telem_logger.debug(
                         "Timeout fetching trajectories",
                         attributes={
                             "consecutive_empty": consecutive_empty,
-                            "accumulated": len(accumulated),
+                            "buffer_size": len(self._replay_buffer),
                             "queue_depth": queue_depth,
                         },
                     )
@@ -190,30 +221,46 @@ class LearnerNode:
                     )
                     raise
 
+            # Update drain counter.
+            if got_new_from_nats:
+                self.consecutive_nats_drains = 0
+            else:
+                self.consecutive_nats_drains += 1
+
+            # Sample from buffer (without removal — IMPALA replay semantics).
+            buf_size = len(self._replay_buffer)
+            if buf_size == 0:
+                return []
+
+            sample_size = min(min_trajectories, buf_size)
+            sample = random.sample(list(self._replay_buffer), sample_size)
+
             total_duration = time.perf_counter() - start_time
             queue_depth = self.psub.pending_msgs if self.psub else 0
 
             learner_attrs = {"component": "learner"}
             record_duration_metric("learner.batch_collection.duration", total_duration, learner_attrs)
             record_value_metric("nats.queue.depth", queue_depth, learner_attrs)
-            record_value_metric("learner.batch.size", len(accumulated), learner_attrs)
+            record_value_metric("learner.batch.size", sample_size, learner_attrs)
+            record_value_metric("learner.replay_buffer.size", buf_size, learner_attrs)
             record_value_metric("nats.message.total_size_bytes", total_message_size, learner_attrs, unit="bytes")
-            increment_counter_metric("learner.trajectories_fetched.total", len(accumulated), learner_attrs)
+            increment_counter_metric("learner.trajectories_fetched.total", sample_size, learner_attrs)
 
-            span.set_attribute("num_trajectories", len(accumulated))
+            span.set_attribute("num_trajectories", sample_size)
+            span.set_attribute("buffer_size", buf_size)
             span.set_attribute("queue_depth", queue_depth)
 
-            if accumulated:
-                telem_logger.info(
-                    "Trajectories fetched",
-                    attributes={
-                        "num_trajectories": len(accumulated),
-                        "queue_depth": queue_depth,
-                        "duration_seconds": total_duration,
-                    },
-                )
+            telem_logger.info(
+                "Trajectories sampled from replay buffer",
+                attributes={
+                    "sample_size": sample_size,
+                    "buffer_size": buf_size,
+                    "queue_depth": queue_depth,
+                    "duration_seconds": total_duration,
+                },
+            )
 
-            return accumulated
+            return sample
     
     async def close(self):
         if self.nc:

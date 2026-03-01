@@ -284,12 +284,18 @@ LEARNER_BATCH_SIZE = 32
 
 async def run_learner_loop(learner: ImpalaLearner, learner_node: LearnerNode,
                            learner_batch_size: int = LEARNER_BATCH_SIZE,
-                           max_empty_fetches: int = 2):
+                           max_empty_fetches: int = 2,
+                           max_nats_drains: int = 3):
     """Run learner loop until actors are done.
 
-    Calls ``GetTrajectories(min_trajectories=learner_batch_size)`` which
-    accumulates messages internally until it has a full batch.  The loop exits
-    when two consecutive fetches return nothing, meaning the queue is drained.
+    ``GetTrajectories`` drains all incoming NATS messages into a replay buffer
+    and returns a random sample of ``learner_batch_size`` trajectories from
+    it.  Nothing is discarded — this keeps the IMPALA off-policy semantics
+    intact.
+
+    The loop stops when NATS has been silent for ``max_nats_drains``
+    consecutive ``GetTrajectories`` calls (i.e. no new trajectories arrived
+    from any actor in that time), which signals that all actors have finished.
     """
     logger.info("📚 Starting Learner Loop")
 
@@ -300,9 +306,9 @@ async def run_learner_loop(learner: ImpalaLearner, learner_node: LearnerNode,
 
     try:
         while True:
-            # Block until we have a full batch (or queue is drained).
-            # max_retries=max_empty_fetches controls how many consecutive
-            # timeouts are tolerated while accumulating.
+            # Drain NATS into replay buffer; return a random sample.
+            # max_retries controls how long to wait for the buffer to fill
+            # on each individual call.
             trajectories = await learner_node.GetTrajectories(
                 timeout=3.0,
                 min_trajectories=learner_batch_size,
@@ -310,8 +316,20 @@ async def run_learner_loop(learner: ImpalaLearner, learner_node: LearnerNode,
             )
 
             if not trajectories:
-                logger.warning("  ⚠️  No trajectories received — queue drained, stopping learner")
+                logger.warning("  ⚠️  No trajectories received — buffer empty, stopping learner")
                 break
+
+            # Stop when NATS has been silent for max_nats_drains calls in a row
+            # (all actors have finished publishing).
+            if learner_node.consecutive_nats_drains >= max_nats_drains:
+                logger.info(
+                    f"  ℹ️  NATS queue drained {learner_node.consecutive_nats_drains}×"
+                    " in a row — actors done, stopping learner"
+                )
+                break
+
+            buf_size = len(learner_node._replay_buffer)
+            logger.info(f"  🗂️  Replay buffer size: {buf_size}")
 
             step += 1
             logger.info(
@@ -437,8 +455,8 @@ async def main():
         DEVICE = "cpu"  # Use CPU for testing
         BATCH_SIZE = 16  # Small batch for testing
         NUM_ACTORS = 5
-        NUM_ITERATIONS = 10  # Number of actor/learner cycles (increased for more training)
-        ACTOR_DELAY = 3.0  # Delay between actor iterations in seconds (slow down actors)
+        NUM_ITERATIONS = 30  # Number of actor/learner cycles (increased for more training)
+        ACTOR_DELAY = 3.0  # Delay between actor iterations in seconds
         
         logger.info("\nConfiguration:")
         logger.info(f"  NATS URL: {NATS_URL}")
@@ -503,16 +521,25 @@ async def main():
         
         try:
             # Create optimizer for the agent model
+            # LR=1e-5: 3e-5 still overshoots — the inverted-V in the loss chart
+            # means the agent crossed the augmented target (prior + sigma*score)
+            # and is now correcting from the other side.  1e-5 is the standard
+            # REINVENT4 RL learning rate.
             optimizer = torch.optim.Adam(
                 agent_adapter.model.network.parameters(),
-                lr=0.0001
+                lr=1e-5
             )
             logger.info("✅ Optimizer ready")
             
             # Create reward strategy
+            # sigma=50: further reduced from 80.
+            # DAP target deviation = sigma * mean_score ≈ 50 * 0.55 = 27.5 nats.
+            # At LR=1e-5, sigma=80 still overshoots (inverted-V arc).
+            # sigma=50 keeps the reward gradient but halves the step magnitude
+            # relative to sigma=80, which should produce a monotone decrease.
             reward_strategy = RLReward(
                 optimizer=optimizer,
-                sigma=120,
+                sigma=50,
                 strategy=dap_strategy
             )
             logger.info("✅ Reward strategy (DAP) ready")
