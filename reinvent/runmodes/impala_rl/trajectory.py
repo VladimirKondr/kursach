@@ -92,8 +92,7 @@ class Trajectory:
     def from_dict(cls, data: dict, device: torch.device = torch.device('cpu')) -> 'Trajectory':
         """Create trajectory from dictionary"""
         import json
-        
-        # Helper function to safely parse data that might be string or list
+        from reinvent.models.model_factory.sample_batch import SmilesState
         def parse_field(field_data):
             if field_data is None:
                 return None
@@ -118,7 +117,7 @@ class Trajectory:
             target_nll=torch.tensor(data['target_nll'], dtype=torch.float32, device=device) if data.get('target_nll') is not None else None,
             reward=torch.tensor(data['reward'], dtype=torch.float32, device=device),
             smiles=data['smiles'],
-            state=data['state'],
+            state=SmilesState[data['state']] if isinstance(data.get('state'), str) and data['state'] in SmilesState.__members__ else data.get('state'),
             model_version=data['model_version'],
             actor_id=data['actor_id'],
             step=data['step']

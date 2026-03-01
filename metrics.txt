@@ -129,3 +129,9 @@ signoz_latency.sum	329
 up	123
 
 1772317692_66d7dfd1
+
+
+
+1772377277_e2d98e74 python3 test_impala_full_integration.py --exp-name slow_ema --sigma 50 --lr 1e-5 --ema-alpha 0.02
+1772377320_fadbeae0 python3 test_impala_full_integration.py --exp-name sig64_slow_lr --sigma 64 --lr 5e-6 --ema-alpha 0.05
+1772377364_d48fa9b5 python3 test_impala_full_integration.py --exp-name base_clean --sigma 50 --lr 1e-5 --ema-alpha 0.05

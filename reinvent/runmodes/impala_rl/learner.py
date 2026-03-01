@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Callable
 import numpy as np
 
 from reinvent.models.model_factory.sample_batch import SmilesState
+from reinvent.models.reinvent.models.model import collate_fn
 from reinvent.runmodes.RL.reward import dap_strategy
 from reinvent.runmodes.impala_rl.nodes.learner_node import LearnerNode
 from reinvent.runmodes.impala_rl.trajectory import Trajectory
@@ -34,6 +35,14 @@ telem_logger = get_logger(__name__)
 tracer = get_tracer(__name__)
 
 class ImpalaLearner(ReinventLearning):
+    # Exponential moving average baseline for score centering.
+    # Tracks the running mean of trajectory scores across all batches,
+    # so the gradient signal reflects *absolute* quality improvement
+    # rather than just relative ranking within a single batch.
+    # alpha=0.05: slow-moving baseline (≈ 20-batch window).
+    _score_ema: float = 0.5
+    _score_ema_alpha: float = 0.05  # slower baseline tracking → sigma*(s-ema) stays non-zero longer
+
     def subscribe(self, learner_node: LearnerNode):
         self.learner_node = learner_node
 
@@ -55,7 +64,7 @@ class ImpalaLearner(ReinventLearning):
         return results
 
     def update(self, results, orig_smilies):
-        """Override parent's update() to apply V-trace off-policy correction.
+        """Override parent's update() to apply clipped IS off-policy correction.
         
         Computes importance weights to correct for trajectories generated
         by old policy (behavior policy) when updating current policy (target policy).
@@ -70,16 +79,25 @@ class ImpalaLearner(ReinventLearning):
         with create_span("learner.update", tracer=tracer) as span:
             update_start = time.perf_counter()
             
-            # 1. Compute NLLs for current agent and prior policies
+            # 1. Compute NLLs for current agent and prior policies.
+            # Use original token-ID sequences (stored in each Trajectory) rather
+            # than re-tokenizing canonical SMILES strings.  RDKit canonicalization
+            # can produce tokens (e.g. [SH]) that are absent from the LSTM
+            # vocabulary even though the molecule is chemically valid.  The
+            # original sequences are guaranteed to contain only vocabulary tokens
+            # because the model itself generated them.
             span.add_event("computing_likelihoods")
-            agent_nlls = self._state.agent.likelihood_smiles(self.sampled.items2)
-            prior_nlls = self.prior.likelihood_smiles(self.sampled.items2)
+            device = self._state.agent.model.device
+            seqs = [traj.sequence.to(device) for traj in self.trajectories]
+            padded_seqs = collate_fn(seqs)
+            agent_nlls = self._state.agent.likelihood(padded_seqs)
+            prior_nlls = self.prior.likelihood(padded_seqs)
             
             # 2. Compute target log probs for each trajectory (using current agent model)
             span.add_event("computing_target_log_probs")
             self._compute_target_log_probs()
             
-            # 3. Compute V-trace importance weights for off-policy correction
+            # 3. Compute trajectory-level clipped IS weights for off-policy correction
             span.add_event("computing_importance_weights")
             importance_weights = self._compute_importance_weights()
             
@@ -101,27 +119,43 @@ class ImpalaLearner(ReinventLearning):
             ### FROM RLReward.__call__()
             scores = torch.from_numpy(scores).to(prior_nlls)
 
-            # FIXME: move NaN filtering before first use of scores in learning
-            # FIXME: reconsider NaN/failure handling
-            nan_idx = torch.isnan(scores)
-            scores_nonnan = scores[~nan_idx]
+            # Build a single boolean mask: valid SMILES AND non-NaN score.
+            # - valid_mask: indices of VALID SMILES (np array of int indices)
+            # - nan_idx: boolean tensor of NaN scores
+            # Both must be False to include a trajectory in the loss.
+            valid_bool = torch.zeros(len(scores), dtype=torch.bool)
+            if len(valid_mask) > 0:
+                valid_bool[torch.from_numpy(valid_mask.astype(int))] = True
+            keep = valid_bool & ~torch.isnan(scores)
 
-            # Normalize scores within the batch to zero mean and unit std.
-            # Without this, a batch where QED spans [0.1, 0.9] produces a
-            # σ·score range of 40 nats, driving large loss spikes regardless
-            # of LR.  Normalizing makes the gradient magnitude depend only on
-            # how far the agent is from the augmented target, not on the
-            # absolute score spread of this particular batch.
-            if scores_nonnan.std() > 1e-6:
-                scores_nonnan = (scores_nonnan - scores_nonnan.mean()) / (scores_nonnan.std() + 1e-8)
+            scores_keep = scores[keep]
+            if scores_keep.numel() == 0:
+                # Nothing to train on this batch — skip update
+                telem_logger.warning("update: no valid non-NaN trajectories in batch, skipping")
+                dummy = torch.tensor(0.0, requires_grad=False)
+                return agent_nlls, prior_nlls, agent_nlls, dummy
 
-            agent_lls = -agent_nlls[~nan_idx]  # negated because we need to minimize
-            prior_lls = -prior_nlls[~nan_idx]
-            importance_weights = importance_weights[~nan_idx]
+            # Track the EMA of scores for monitoring/logging only.
+            # DO NOT subtract it from scores before passing to dap_strategy.
+            # DAP uses a squared-error objective: aug_lls = prior_lls + σ·score.
+            # Subtracting a baseline shifts the target itself (not just the
+            # gradient variance), which causes aug_target → prior as EMA catches
+            # up to mean scores, making loss increase as agent diverges.
+            # Standard REINVENT DAP always uses raw scores here.
+            batch_mean = float(scores_keep.mean().item())
+            self._score_ema = (
+                (1 - self._score_ema_alpha) * self._score_ema
+                + self._score_ema_alpha * batch_mean
+            )
+            record_value_metric("learner.score_ema_baseline", self._score_ema)
+
+            agent_lls = -agent_nlls[keep]
+            prior_lls = -prior_nlls[keep]
+            importance_weights = importance_weights[keep]
 
             loss, augmented_lls = self._strategy(
                 agent_lls,
-                scores_nonnan,
+                scores_keep,  # raw scores — no EMA centering for DAP target
                 prior_lls,
                 self._sigma,
             )
@@ -129,13 +163,43 @@ class ImpalaLearner(ReinventLearning):
             loss = loss * importance_weights.detach()
 
             if self.inception is not None:
+                # Pass uncentered raw scores so inception can do its own
+                # normalization; pass orig_smilies/prior_lls filtered by the
+                # same combined keep mask (valid AND non-NaN).
+                keep_np = keep.cpu().numpy()
                 inception_result = self.inception(
-                    np.array(orig_smilies)[mask_idx], scores_nonnan[mask_idx], prior_lls[mask_idx]
+                    np.array(orig_smilies)[keep_np],
+                    scores_keep.cpu().numpy(),
+                    prior_lls,
                 )
                 
                 # Check if inception returned valid data (may be None if memory is empty)
                 if inception_result is not None:
                     _orig_smilies, _scores, _prior_lls = inception_result
+
+                    # Inception stores SMILES strings without original sequences.
+                    # RDKit canonicalization may have introduced tokens (e.g. [SH])
+                    # absent from the vocabulary.  Filter those out before calling
+                    # likelihood_smiles so they don't crash the training loop.
+                    _vocab = agent.model.vocabulary
+                    _tokenizer = agent.model.tokenizer
+                    _ok = [
+                        all(t in _vocab for t in _tokenizer.tokenize(smi))
+                        for smi in _orig_smilies
+                    ]
+                    if not any(_ok):
+                        inception_result = None  # nothing usable this step
+                    else:
+                        _ok_arr = np.array(_ok)
+                        _orig_smilies = [s for s, ok in zip(_orig_smilies, _ok) if ok]
+                        _scores = np.array(_scores)[_ok_arr]
+                        if isinstance(_prior_lls, torch.Tensor):
+                            _prior_lls = _prior_lls[_ok_arr]
+                        else:
+                            _prior_lls = np.array(_prior_lls)[_ok_arr]
+
+                if inception_result is not None:
+                    _orig_smilies, _scores, _prior_lls = _orig_smilies, _scores, _prior_lls
 
                     # compute the agent NLLs for the _current_ state of the agent
                     lls = agent.likelihood_smiles(_orig_smilies)
@@ -173,6 +237,26 @@ class ImpalaLearner(ReinventLearning):
             record_value_metric("learner.loss", float(loss.item()))
             record_value_metric("learner.agent_nll.mean", float(agent_nlls.mean().item()))
             record_value_metric("learner.prior_nll.mean", float(prior_nlls.mean().item()))
+
+            # Gap between DAP target and current agent (nats).
+            # gap > 0: agent hasn't reached the target yet (normal early training).
+            # gap ≈ 0: agent has converged to augmented distribution.
+            # gap < 0: agent overshot the target.
+            gap = augmented_lls - agent_lls  # shape: (batch,)
+            record_value_metric("learner.target_gap.mean", float(gap.mean().item()))
+            record_value_metric("learner.target_gap.abs_mean", float(gap.abs().mean().item()))
+
+            # Staleness: how many learner updates ago were these trajectories
+            # generated?  Large staleness means IS weights do heavy lifting.
+            if hasattr(self, 'learner_node') and self.learner_node is not None:
+                current_version = self.learner_node.model_version
+                staleness = [
+                    current_version - getattr(traj, 'model_version', current_version)
+                    for traj in self.trajectories
+                ]
+                if staleness:
+                    record_value_metric("learner.staleness.mean", float(np.mean(staleness)))
+                    record_value_metric("learner.staleness.max", float(max(staleness)))
             
             # Record per-actor importance weights for monitoring individual actors
             for traj, weight in zip(self.trajectories, importance_weights):
@@ -213,22 +297,32 @@ class ImpalaLearner(ReinventLearning):
             span.set_attribute("num_trajectories", len(self.trajectories))
     
     def _compute_importance_weights(self, clip_rho=2.0, normalize=True):
-        """Compute importance weights for off-policy correction using Clipped IS.
-        
-        Clipped Importance Sampling (V-trace style):
-            w_i = min(clip_rho, π_target(τ_i) / π_behavior(τ_i))
-            
-        Clipping is performed in log-space first, then numerically-stable exp:
-            log_w_i = min(log(clip_rho), log_ratio_i)     <-- actual clipping
-            w_i = exp(log_w_i - max(log_w))               <-- stable exp (cancels in normalization)
-            
-        With normalization (Self-normalized IS):
-            w̃_i = w_i / Σ_j w_j * N    (unbiased; N = batch size)
-            
+        """Compute trajectory-level importance weights for off-policy correction.
+
+        Because molecular generation is a bandit (reward is a scalar on the
+        complete molecule, not per-step), we need only trajectory-level IS —
+        NOT per-step V-trace credit assignment that IMPALA uses for MDPs.
+
+        Each trajectory's weight is:
+            log_w_i = log p_target(τ_i) - log p_behavior(τ_i)
+                    = Σ_t log π_target(a_t) - Σ_t log π_behavior(a_t)
+
+        Symmetric clipping in log-space:
+            log_w_i = clamp(log_w_i, -log(clip_rho), +log(clip_rho))
+
+        Upper clip  — prevents over-weighting very on-policy (fresh) trajectories.
+        Lower clip  — prevents near-zero weights for stale trajectories; without it,
+                      effective batch size collapses from 32 to ~5-8 when actors are
+                      a few versions behind the learner.
+
+        Self-normalized IS (normalize=True):
+            w̃_i = w_i / (Σ_j w_j) * N    (reduces variance; slightly biased but
+                                            consistent estimator)
+
         Args:
-            clip_rho: Clipping threshold for importance weight (default: 5.0)
-            normalize: Whether to apply self-normalized IS (default: True)
-            
+            clip_rho: symmetric clipping threshold in ratio space (default: 2.0)
+            normalize: apply self-normalized IS (default: True)
+
         Returns:
             Tensor of importance weights [batch_size]
         """
@@ -252,7 +346,7 @@ class ImpalaLearner(ReinventLearning):
             
             # Step 1: Clip in log-space BEFORE any numerical tricks.
             # Symmetric clipping: clamp(log_ratio, [-log_rho, +log_rho])
-            # Upper clip: standard V-trace — prevents over-weighting fresh trajectories.
+            # Upper clip: prevents over-weighting fresh (near on-policy) trajectories.
             # Lower clip: CRITICAL for same-machine distributed setup.
             #   Without it, very stale actors (3-5 versions behind) produce
             #   log_ratio << 0 → IS weight → 0 → effective batch shrinks from 32
@@ -261,13 +355,13 @@ class ImpalaLearner(ReinventLearning):
             #   so all 32 trajectories always contribute meaningfully.
             log_clip_rho = math.log(clip_rho)
             clipped_log_ratios = torch.clamp(log_ratios, min=-log_clip_rho, max=log_clip_rho)
-            
-            # Step 2: Numerical stability for exp — subtract max of the CLIPPED ratios.
-            # This shift cancels out during normalization, so it doesn't affect the result.
+
+            # Numerical stability: subtract max before exp.
+            # The shift cancels out during self-normalization.
             center = clipped_log_ratios.max()
             importance_weights = torch.exp(clipped_log_ratios - center)
-            
-            # Step 3: Self-normalized IS
+
+            # Self-normalized IS: w̃_i = w_i / Σw_j * N
             if normalize:
                 weight_sum = importance_weights.sum()
                 if weight_sum > 0:

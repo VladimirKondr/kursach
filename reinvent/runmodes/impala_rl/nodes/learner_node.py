@@ -36,33 +36,45 @@ class LearnerNode:
         self, 
         queue_url: str = "localhost:4222", 
         publish_sibject: str = "jobs.result",
+        stream_name: str = "impala_trajectories",
         model_update_subject: str = "model.update",
         model_bucket: str = "models",
         model_key: str = "current_model",
         buffer_capacity: int = 2000,
+        max_staleness: int | None = None,
     ):
         self.queue_url = queue_url
         self.publish_sibject = publish_sibject
+        self.stream_name = stream_name
         self.model_update_subject = model_update_subject
         self.model_bucket = model_bucket
         self.model_key = model_key
         self.max_retries = 10
         self.model_version = 0
 
+        # Maximum allowed staleness (learner_version - traj.model_version).
+        # Trajectories older than this are evicted before sampling.
+        # None = disabled (keep all trajectories regardless of age).
+        # Typical value: ~50 learner steps (beyond that IS clipping at rho=2.0
+        # makes the correction too weak to be useful).
+        self.max_staleness = max_staleness
+
         self.psub = None
         self.nc = None
         self.js = None
 
-        # Replay buffer: всe поступающие траектории
-        # накапливаются здесь; лёрнер сэмплирует из него.
-        # maxlen=buffer_capacity гарантирует, что старые
-        # (слишком устаревшие) траектории вытесняются.
+        # Trajectory queue: все поступающие траектории
+        # накапливаются здесь; лёрнер **потребляет** их (удаляет
+        # после сэмплирования), так что каждая траектория
+        # обрабатывается ровно один раз.
+        # IS-веса корректируют staleness старых записей.
+        # maxlen=buffer_capacity гарантирует, что при переполнении
+        # самые старые вытесняются (не должно возникать на практике).
         self._replay_buffer: collections.deque["Trajectory"] = collections.deque(
             maxlen=buffer_capacity
         )
-        # Сколько раз подряд GetTrajectories отдало выборку
-        # из буфера без получения новых данных из NATS.
-        # Когда это число достигает порога — очередь истощилась.
+        # Сколько раз подряд GetTrajectories получило 0 новых
+        # сообщений из NATS (для диагностики).
         self.consecutive_nats_drains: int = 0
     async def Connect(self):
         with create_span("learner_node.connect", tracer=tracer) as _:
@@ -74,7 +86,7 @@ class LearnerNode:
                     max_reconnect_attempts=-1 
                 )
                 self.js = self.nc.jetstream()
-                self.psub = await self.js.pull_subscribe("jobs.result", durable="center_processor")
+                self.psub = await self.js.pull_subscribe(self.publish_sibject, durable="center_processor", stream=self.stream_name)
                 
                 telem_logger.info(
                     "Learner node connected to NATS",
@@ -99,30 +111,30 @@ class LearnerNode:
         max_retries: int | None = None,
         min_trajectories: int = 1,
     ) -> list[Trajectory]:
-        """Drain NATS into the replay buffer, then return a random sample.
+        """Drain NATS into the trajectory queue, then consume a random batch.
 
-        All received trajectories are stored in ``self._replay_buffer``
-        (a bounded deque).  The method blocks until the buffer contains at
-        least ``min_trajectories`` items, then returns a random sample of
-        exactly ``min_trajectories`` trajectories **without removing them**
-        from the buffer (so every trajectory can be used multiple times by
-        future updates, consistent with the IMPALA off-policy design).
+        All received trajectories are appended to ``self._replay_buffer``.
+        The method blocks until the buffer contains at least
+        ``min_trajectories`` items, then **removes and returns** a random
+        sample of exactly ``min_trajectories`` trajectories.
 
-        The method returns an empty list only when NATS has been silent for
-        ``max_retries`` consecutive timeouts **and** the buffer still has
-        fewer than ``min_trajectories`` items — i.e. the queue is truly
-        drained and we have nothing to train on.
+        Each trajectory is processed exactly once.  IS-weights in the learner
+        correct for policy staleness (off-policy IMPALA semantics).
+
+        Returns an empty list when NATS is silent AND the buffer is empty —
+        i.e. all work is done.
 
         Args:
             timeout:          Per-fetch NATS timeout in seconds.
             batch_size:       Number of NATS messages requested per fetch call.
             max_retries:      Consecutive timeouts tolerated while waiting for
                               the buffer to fill (defaults to self.max_retries).
-            min_trajectories: Desired sample size returned to the caller.
+            min_trajectories: Desired batch size returned to the caller.
 
         Returns:
-            Random sample of ``min_trajectories`` Trajectory objects,
-            or fewer if the queue is fully drained, or [] to signal stop.
+            Random batch of ``min_trajectories`` Trajectory objects (removed
+            from the internal queue), or fewer if the queue is fully drained,
+            or [] when nothing is left.
         """
         effective_max_retries = self.max_retries if max_retries is None else max_retries
 
@@ -140,18 +152,36 @@ class LearnerNode:
                 return []
 
             total_message_size = 0
-            consecutive_empty = 0
+            new_from_nats = 0
             start_time = time.perf_counter()
 
-            got_new_from_nats = False  # did this call receive any new NATS messages?
+            # ── Phase 1: Eager non-blocking drain ────────────────────────────
+            # Always try to pull everything currently sitting in NATS into the
+            # replay buffer, regardless of buffer size.  This keeps the buffer
+            # fresh and the nats.queue.depth metric accurate.
+            try:
+                while True:
+                    msgs = await self.psub.fetch(batch_size, timeout=0.05)
+                    for msg in msgs:
+                        headers = msg.header if hasattr(msg, "header") else None
+                        _parent_context = extract_trace_context(headers)
+                        data_list = json.loads(msg.data.decode())
+                        total_message_size += len(msg.data)
+                        for traj_dict in data_list:
+                            self._replay_buffer.append(Trajectory.from_dict(traj_dict))
+                            new_from_nats += 1
+                        await msg.ack()
+            except nats.errors.TimeoutError:
+                pass  # queue is empty — that's fine
+            except Exception as e:
+                telem_logger.error(f"Eager drain error: {str(e)}")
 
-            # Block until replay buffer has enough items or queue is drained.
+            # ── Phase 2: Blocking wait (only if buffer still too small) ──────
+            consecutive_empty = 0
             while len(self._replay_buffer) < min_trajectories:
                 if consecutive_empty >= effective_max_retries:
-                    queue_depth = self.psub.pending_msgs if self.psub else 0
                     buf_size = len(self._replay_buffer)
                     if buf_size > 0:
-                        # Partial batch — still useful, return what we have.
                         telem_logger.info(
                             "GetTrajectories: buffer has partial batch, returning",
                             attributes={"buffer_size": buf_size,
@@ -160,8 +190,7 @@ class LearnerNode:
                     else:
                         telem_logger.error(
                             "GetTrajectories: queue drained and buffer empty",
-                            attributes={"queue_depth": queue_depth,
-                                        "max_retries": effective_max_retries},
+                            attributes={"max_retries": effective_max_retries},
                         )
                         increment_counter_metric(
                             "learner.get_trajectories.failures.total", 1,
@@ -170,49 +199,32 @@ class LearnerNode:
                     break
 
                 try:
-                    span.add_event("fetching_messages",
+                    span.add_event("waiting_for_buffer",
                                    {"buffer_size": len(self._replay_buffer),
                                     "consecutive_empty": consecutive_empty})
                     msgs = await self.psub.fetch(batch_size, timeout=timeout)
-
-                    consecutive_empty = 0  # got messages — reset timeout counter
-
-                    got_new_from_nats = True
-                    new_count = 0
+                    consecutive_empty = 0
                     for msg in msgs:
                         headers = msg.header if hasattr(msg, "header") else None
                         _parent_context = extract_trace_context(headers)
-
                         data_list = json.loads(msg.data.decode())
                         total_message_size += len(msg.data)
-
                         for traj_dict in data_list:
                             self._replay_buffer.append(Trajectory.from_dict(traj_dict))
-                            new_count += 1
-
+                            new_from_nats += 1
                         await msg.ack()
-
-                    telem_logger.debug(
-                        "GetTrajectories: added to buffer",
-                        attributes={"new": new_count,
-                                    "buffer_size": len(self._replay_buffer)},
-                    )
-
                 except nats.errors.TimeoutError:
                     consecutive_empty += 1
-                    queue_depth = self.psub.pending_msgs if self.psub else 0
                     telem_logger.debug(
-                        "Timeout fetching trajectories",
+                        "Timeout waiting for trajectories",
                         attributes={
                             "consecutive_empty": consecutive_empty,
                             "buffer_size": len(self._replay_buffer),
-                            "queue_depth": queue_depth,
                         },
                     )
                     increment_counter_metric(
                         "nats.fetch.timeouts.total", 1, {"component": "learner"}
                     )
-                    continue
                 except Exception as e:
                     telem_logger.error(f"Fetch error: {str(e)}")
                     increment_counter_metric(
@@ -222,40 +234,88 @@ class LearnerNode:
                     raise
 
             # Update drain counter.
-            if got_new_from_nats:
+            if new_from_nats > 0:
                 self.consecutive_nats_drains = 0
             else:
                 self.consecutive_nats_drains += 1
 
-            # Sample from buffer (without removal — IMPALA replay semantics).
+            # ── Phase 3: Staleness eviction + Sample + metrics ────────────────
+            # Evict trajectories that are too stale for IS correction to be useful.
+            stale_evicted = 0
+            if self.max_staleness is not None:
+                buf_before = len(self._replay_buffer)
+                fresh = [
+                    t for t in self._replay_buffer
+                    if (self.model_version - getattr(t, "model_version", self.model_version))
+                    <= self.max_staleness
+                ]
+                stale_evicted = buf_before - len(fresh)
+                if stale_evicted > 0:
+                    self._replay_buffer = collections.deque(fresh, maxlen=self._replay_buffer.maxlen)
+                    telem_logger.info(
+                        "Evicted stale trajectories from replay buffer",
+                        attributes={"evicted": stale_evicted, "remaining": len(fresh)},
+                    )
+
             buf_size = len(self._replay_buffer)
             if buf_size == 0:
                 return []
 
             sample_size = min(min_trajectories, buf_size)
-            sample = random.sample(list(self._replay_buffer), sample_size)
+
+            # Destructive random sample: pick indices, remove from buffer.
+            buf_list = list(self._replay_buffer)
+            indices = sorted(random.sample(range(buf_size), sample_size), reverse=True)
+            sample = [buf_list[i] for i in reversed(indices)]
+            for i in indices:
+                del buf_list[i]
+            self._replay_buffer = collections.deque(buf_list, maxlen=self._replay_buffer.maxlen)
+
+            # Get accurate pending count from JetStream consumer info
+            nats_pending = 0
+            try:
+                info = await self.js.consumer_info(self.stream_name, "center_processor")
+                nats_pending = info.num_pending
+            except Exception:
+                pass
+            # Accurate combined "pending trajectories" metric:
+            #   = trajectories still sitting in NATS (not yet pulled)
+            #   + trajectories already in replay buffer (pulled but not trained on)
+            # Each NATS message carries batch_size trajectories (approximate).
+            nats_pending_trajs = nats_pending * batch_size
+            buffer_remaining = len(self._replay_buffer)  # after destructive sample
+            pending_trajectories = nats_pending_trajs + buffer_remaining
 
             total_duration = time.perf_counter() - start_time
-            queue_depth = self.psub.pending_msgs if self.psub else 0
 
             learner_attrs = {"component": "learner"}
             record_duration_metric("learner.batch_collection.duration", total_duration, learner_attrs)
-            record_value_metric("nats.queue.depth", queue_depth, learner_attrs)
+            record_value_metric("nats.queue.depth", nats_pending, learner_attrs)
+            record_value_metric("nats.pending_trajectories", nats_pending_trajs, learner_attrs)
+            # pending_trajectories: total generated-but-not-consumed across NATS + replay buffer.
+            # Use this to check if actors outpace the learner (rising value)
+            # or if the learner starves (near zero).
+            record_value_metric("pending_trajectories", pending_trajectories, learner_attrs)
             record_value_metric("learner.batch.size", sample_size, learner_attrs)
             record_value_metric("learner.replay_buffer.size", buf_size, learner_attrs)
+            record_value_metric("learner.new_trajectories_from_nats", new_from_nats, learner_attrs)
             record_value_metric("nats.message.total_size_bytes", total_message_size, learner_attrs, unit="bytes")
+            record_value_metric("learner.stale_evicted", stale_evicted, learner_attrs)
+            increment_counter_metric("learner.stale_evicted.total", stale_evicted, learner_attrs)
             increment_counter_metric("learner.trajectories_fetched.total", sample_size, learner_attrs)
 
             span.set_attribute("num_trajectories", sample_size)
             span.set_attribute("buffer_size", buf_size)
-            span.set_attribute("queue_depth", queue_depth)
+            span.set_attribute("nats_pending", nats_pending)
 
             telem_logger.info(
                 "Trajectories sampled from replay buffer",
                 attributes={
                     "sample_size": sample_size,
                     "buffer_size": buf_size,
-                    "queue_depth": queue_depth,
+                    "new_from_nats": new_from_nats,
+                    "nats_pending_msgs": nats_pending,
+                    "nats_pending_trajs": nats_pending_trajs,
                     "duration_seconds": total_duration,
                 },
             )
