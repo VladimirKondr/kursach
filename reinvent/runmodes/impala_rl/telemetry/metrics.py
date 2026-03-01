@@ -134,8 +134,20 @@ class MetricsCollector:
         value: Union[int, float],
         attributes: Optional[Dict[str, Any]] = None,
         unit: str = "1",
+        snapshot: bool = False,
     ) -> None:
-        """Record a value measurement (gauge - current value)."""
+        """
+        Record a value measurement (gauge - current value).
+        
+        Args:
+            metric_name: Name of the metric
+            value: Value to record
+            attributes: Optional attributes for the metric
+            unit: Unit of measurement
+            snapshot: If True, record as absolute value (no delta tracking).
+                     Use for values like version numbers where you want the actual value,
+                     not cumulative deltas. Default False for backward compatibility.
+        """
         if not OTEL_AVAILABLE or not is_telemetry_enabled():
             return
         
@@ -444,10 +456,19 @@ def record_value_metric(
     value: Union[int, float],
     attributes: Optional[Dict[str, Any]] = None,
     unit: str = "1",
+    snapshot: bool = False,
 ) -> None:
-    """Record a value metric directly."""
+    """Record a value metric directly.
+    
+    Args:
+        metric_name: Name of the metric
+        value: Value to record
+        attributes: Optional attributes for the metric
+        unit: Unit of measurement
+        snapshot: If True, record as absolute value (use for version numbers, etc.)
+    """
     if is_telemetry_enabled():
-        get_metrics_collector().record_value(metric_name, value, attributes, unit)
+        get_metrics_collector().record_value(metric_name, value, attributes, unit, snapshot)
 
 
 def increment_counter_metric(

@@ -6,6 +6,7 @@ and send trajectories to the learner.
 """
 
 import logging
+import threading
 import time
 import numpy as np
 import torch
@@ -73,6 +74,7 @@ class ImpalaActor:
             self.scoring_function = scoring_function
             self.device = torch.device(config.device)
             self.model_version = model_version
+            self._model_lock = threading.Lock()  # serializes sampling (thread) and model update (executor)
             
             telem_logger.info(
                 "Actor initializing",
@@ -104,11 +106,10 @@ class ImpalaActor:
             self.sampler: ReinventSampler
             self.sampler, _ = setup_sampler(self.model_type, sampler_params, self.adapter)
             
-            TRANSFORMERS = ["Mol2Mol", "LinkinventTransformer", "LibinventTransformer", "Pepinvent"]
-            if self.model_type in TRANSFORMERS:
-                self.rdkit_smiles_flags = dict(sanitize=True, isomericSmiles=True)
-            else:
-                self.rdkit_smiles_flags = dict(allowTautomers=True)
+            # Note: SMILES sanitization is handled inside validate_smiles() via
+            # Chem.SanitizeMol(mol, catchErrors=True).  A small failure rate (~2%)
+            # is expected from a generative language model and is tracked via the
+            # actor.smiles.valid.ratio metric.
             
             self.step_count = 0
             
@@ -138,10 +139,11 @@ class ImpalaActor:
         ) as span:
             start_time = time.perf_counter()
             
-            # Sample molecules
+            # Sample molecules — hold lock to prevent concurrent model update
             span.add_event("sampling_molecules")
             sample_start = time.perf_counter()
-            sampled = self.sampler.sample_impala([])
+            with self._model_lock:
+                sampled = self.sampler.sample_impala([])
             sample_duration = time.perf_counter() - sample_start
             
             # Record sampling metrics
@@ -257,8 +259,9 @@ class ImpalaActor:
             
             old_version = self.model_version
             version_lag = model_version - old_version
-            
-            self.adapter.model.network.load_state_dict(new_model_state)
+
+            with self._model_lock:
+                self.adapter.model.network.load_state_dict(new_model_state)
             self.model_version = model_version
             
             duration = time.perf_counter() - start_time
@@ -266,8 +269,7 @@ class ImpalaActor:
             # Record metrics
             attributes = {"actor_id": self.actor_id}
             record_duration_metric("actor.model_update.duration", duration, attributes)
-            record_value_metric("model.version.current", model_version, attributes)
-            record_value_metric("model.version.lag", version_lag, attributes)
+            # model.version.current is recorded in actor_node.py with proper worker_id
             
             span.set_attribute("duration", duration)
             span.set_attribute("version_lag", version_lag)

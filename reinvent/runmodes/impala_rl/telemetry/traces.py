@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # Try to import OpenTelemetry, handle gracefully if not available
 try:
     from opentelemetry import trace
-    from opentelemetry.trace import Status, StatusCode, Span, Tracer
+    from opentelemetry.trace import Status, StatusCode
     from opentelemetry.trace.propagation import get_current_span
     OTEL_AVAILABLE = True
 except ImportError:
@@ -64,6 +64,14 @@ def _safe_add_event(span: Any, name: str, attributes: Optional[Dict[str, Any]] =
         logger.debug(f"Failed to add event to span: {e}")
 
 
+class _DummySpan:
+    """No-op span used when telemetry is disabled or span initialisation fails."""
+    def set_attribute(self, key, value): pass
+    def add_event(self, name, attributes=None): pass
+    def set_status(self, status): pass
+    def record_exception(self, exception): pass
+
+
 @contextmanager
 def create_span(
     name: str,
@@ -87,16 +95,10 @@ def create_span(
         kind: Optional span kind (INTERNAL, CLIENT, SERVER, etc.)
     """
     if not OTEL_AVAILABLE or not is_telemetry_enabled():
-        # No-op context manager
-        class DummySpan:
-            def set_attribute(self, key, value): pass
-            def add_event(self, name, attributes=None): pass
-            def set_status(self, status): pass
-            def record_exception(self, exception): pass
-        
-        yield DummySpan()
+        yield _DummySpan()
         return
     
+    _yielded = False
     try:
         if tracer is None:
             # Get tracer from the calling module
@@ -115,21 +117,21 @@ def create_span(
             if attributes:
                 _safe_add_attributes(span, attributes)
             
+            _yielded = True
             try:
                 yield span
             except Exception as e:
                 _safe_record_exception(span, e)
                 raise
     except Exception as e:
+        if _yielded:
+            # Exception was thrown into the generator from the consumer code.
+            # @contextmanager forbids a second yield after throw() — just re-raise.
+            raise
+        # Error occurred during span initialisation (before yield) — fall back to
+        # a no-op span so the caller can continue normally.
         logger.debug(f"Error in create_span: {e}")
-        # Yield dummy span on error
-        class DummySpan:
-            def set_attribute(self, key, value): pass
-            def add_event(self, name, attributes=None): pass
-            def set_status(self, status): pass
-            def record_exception(self, exception): pass
-        
-        yield DummySpan()
+        yield _DummySpan()
 
 
 def trace_operation(

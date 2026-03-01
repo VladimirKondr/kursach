@@ -1,0 +1,131 @@
+====================================================================================================
+IMPALA TRAINING RUN LOGS - Run ID: 1772315448_1a33f518
+Generated: 2026-03-01 01:14:02.168240
+====================================================================================================
+
+📊 ALL METRICS FOR THIS RUN
+----------------------------------------------------------------------------------------------------
+Error: Received exception from server (version 25.5.6):
+Code: 47. DB::Exception: Received from localhost:9000. DB::Exception: Unknown expression identifier `attributes` in scope SELECT toDateTime(unix_milli / 1000) AS timestamp, metric_name, value, attributes FROM signoz_metrics.distributed_samples_v4 WHERE toDateTime(unix_milli / 1000) >= (now() - toIntervalHour(2)) ORDER BY timestamp ASC. (UNKNOWN_IDENTIFIER)
+(query: SELECT 
+          toDateTime(unix_milli/1000) as timestamp,
+          metric_name,
+          value,
+          attributes
+        FROM signoz_metrics.distributed_samples_v4
+        WHERE toDateTime(unix_milli/1000) >= now() - INTERVAL 2 HOUR
+        ORDER BY timestamp
+        FORMAT TabSeparatedWithNames
+        )
+
+
+📈 SUMMARY STATISTICS
+----------------------------------------------------------------------------------------------------
+Loss Statistics:
+53	0.0028182354290038347	10728.693359375	5066.178292528801
+
+
+Reward Statistics:
+583	0.4122360944747925	0.7116230130195618	0.5663928397217092
+
+
+SMILES Validity Statistics:
+583	0.8125	1	0.9829545454545454
+
+
+All Metrics Collected:
+actor.model_decompress.duration	166
+actor.model_download.duration	176
+actor.model_load.duration	176
+actor.model_load.failures.total	234
+actor.reward.max	583
+actor.reward.mean	583
+actor.reward.min	583
+actor.sampling.duration	270
+actor.scoring.duration	270
+actor.smiles.valid.ratio	583
+actor.trajectories_generated.total	583
+actor.trajectory_generation.duration	583
+exporter_db_write_latency.bucket	27552
+exporter_db_write_latency.count	1722
+exporter_db_write_latency.sum	1722
+exporter_prepare_metrics_duration.bucket	1968
+exporter_prepare_metrics_duration.count	123
+exporter_prepare_metrics_duration.sum	123
+learner.agent_nll.mean	53
+learner.batch.size	54
+learner.batch_collection.duration	54
+learner.compute_importance_weights.duration	54
+learner.compute_target_log_probs.duration	54
+learner.get_trajectories.failures.total	2
+learner.importance_weight	264
+learner.importance_weights.max	53
+learner.importance_weights.mean	53
+learner.importance_weights.min	53
+learner.loss	53
+learner.model_commit.duration	52
+learner.model_commit.failures.total	6
+learner.model_commits.total	52
+learner.model_serialize.duration	52
+learner.model_upload.duration	52
+learner.prior_nll.mean	53
+learner.swarm_notifications.total	52
+learner.trajectories_fetched.total	54
+learner.update.duration	53
+model.compression_ratio	50
+model.size_bytes	228
+model.size_uncompressed_bytes	50
+model.version.current	228
+model.version.lag	107
+nats.connection.state	324
+nats.fetch.duration	54
+nats.fetch.timeouts.total	2
+nats.message.size_bytes	270
+nats.message.total_size_bytes	54
+nats.publish.duration	270
+nats.publish.failures.total	102
+nats.publish.total	270
+nats.queue.depth	54
+nats.serialize.duration	270
+otelcol_connector.produced.items.count	123
+otelcol_connector.received.items.count	369
+otelcol_exporter_queue_capacity	738
+otelcol_exporter_queue_size	738
+otelcol_exporter_send_failed_log_records	246
+otelcol_exporter_send_failed_metric_points	369
+otelcol_exporter_send_failed_spans	246
+otelcol_exporter_sent_log_records	246
+otelcol_exporter_sent_metric_points	369
+otelcol_exporter_sent_spans	246
+otelcol_process_cpu_seconds	123
+otelcol_process_memory_rss	123
+otelcol_process_runtime_heap_alloc_bytes	123
+otelcol_process_runtime_total_alloc_bytes	123
+otelcol_process_runtime_total_sys_memory_bytes	123
+otelcol_process_uptime	123
+otelcol_processor_batch_batch_send_size.bucket	5658
+otelcol_processor_batch_batch_send_size.count	246
+otelcol_processor_batch_batch_send_size.sum	246
+otelcol_processor_batch_metadata_cardinality	246
+otelcol_processor_batch_timeout_trigger_send	246
+otelcol_receiver_accepted_log_records	123
+otelcol_receiver_accepted_metric_points	246
+otelcol_receiver_accepted_spans	123
+otelcol_receiver_failed_log_records	123
+otelcol_receiver_failed_metric_points	246
+otelcol_receiver_failed_spans	123
+otelcol_receiver_refused_log_records	123
+otelcol_receiver_refused_metric_points	246
+otelcol_receiver_refused_spans	123
+promhttp_metric_handler_errors_total	246
+scrape_duration_seconds	123
+scrape_samples_post_metric_relabeling	123
+scrape_samples_scraped	123
+scrape_series_added	123
+signoz_calls_total	329
+signoz_latency.bucket	5922
+signoz_latency.count	329
+signoz_latency.sum	329
+up	123
+
+1772317692_66d7dfd1

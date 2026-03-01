@@ -276,57 +276,79 @@ async def run_actor_loop(actor_node: ActorNode, num_iterations: int = 5, delay: 
         raise
 
 
-async def run_learner_loop(learner: ImpalaLearner, learner_node: LearnerNode, num_iterations: int = 5):
-    """Run learner to process trajectories and update model"""
+# Learner batch size: how many trajectories to collect before each gradient step.
+# With BATCH_SIZE=16 per actor and NUM_ACTORS=5 this gives 2-3 actor rounds per
+# learner update, keeping gradient estimates stable.
+LEARNER_BATCH_SIZE = 32
+
+
+async def run_learner_loop(learner: ImpalaLearner, learner_node: LearnerNode,
+                           learner_batch_size: int = LEARNER_BATCH_SIZE,
+                           max_empty_fetches: int = 2):
+    """Run learner loop until actors are done.
+
+    Calls ``GetTrajectories(min_trajectories=learner_batch_size)`` which
+    accumulates messages internally until it has a full batch.  The loop exits
+    when two consecutive fetches return nothing, meaning the queue is drained.
+    """
     logger.info("📚 Starting Learner Loop")
-    
+
     initial_loss = None
     losses = []
     rewards = []
-    
+    step = 0
+
     try:
-        for i in range(num_iterations):
-            logger.info(f"📥 [Learner] Iteration {i + 1}/{num_iterations} | Current model version: {learner_node.model_version}")
-            
-            # Get trajectories from NATS
-            trajectories = await learner_node.GetTrajectories(timeout=15.0)
-            
-            if trajectories:
-                logger.info(f"  Received {len(trajectories)} trajectories")
-                
-                # Set trajectories in learner
-                learner.trajectories = trajectories
-                
-                # Convert trajectories to sample batch
-                learner.sampled = learner._trajectories_to_sample_batch(trajectories)
-                
-                # Score (uses pre-computed rewards from trajectories)
-                results = learner.score()
-                
-                # Update model with V-trace correction
-                orig_smilies = [traj.smiles for traj in trajectories]
-                agent_lls, prior_lls, augmented_lls, loss = learner.update(results, orig_smilies)
-                
-                mean_reward = results.total_scores.mean()
-                losses.append(float(loss))
-                rewards.append(float(mean_reward))
-                
-                if initial_loss is None:
-                    initial_loss = float(loss)
-                
-                logger.info(f"  📉 Loss: {loss:.4f}")
-                logger.info(f"  📊 Mean reward: {mean_reward:.4f}")
-                logger.info(f"  📈 Agent NLLs: {agent_lls.mean():.4f}")
-                
-                # Commit model to NATS and notify swarm
-                new_version = learner_node.model_version + 1
-                logger.info(f"  💾 Committing model version {new_version}")
-                await learner_node.commit_model(learner._state.agent.model)
-                logger.info(f"  ✅ Model v{new_version} published to actors")
-                
-            else:
-                logger.warning("  ⚠️  No trajectories received (timeout)")
-            
+        while True:
+            # Block until we have a full batch (or queue is drained).
+            # max_retries=max_empty_fetches controls how many consecutive
+            # timeouts are tolerated while accumulating.
+            trajectories = await learner_node.GetTrajectories(
+                timeout=3.0,
+                min_trajectories=learner_batch_size,
+                max_retries=max_empty_fetches,
+            )
+
+            if not trajectories:
+                logger.warning("  ⚠️  No trajectories received — queue drained, stopping learner")
+                break
+
+            step += 1
+            logger.info(
+                f"📥 [Learner] Iteration {step} | Current model version: {learner_node.model_version}"
+            )
+            logger.info(f"  Received {len(trajectories)} trajectories")
+
+            # Set trajectories in learner
+            learner.trajectories = trajectories
+
+            # Convert trajectories to sample batch
+            learner.sampled = learner._trajectories_to_sample_batch(trajectories)
+
+            # Score (uses pre-computed rewards from trajectories)
+            results = learner.score()
+
+            # Update model with V-trace correction
+            orig_smilies = [traj.smiles for traj in trajectories]
+            agent_lls, prior_lls, augmented_lls, loss = learner.update(results, orig_smilies)
+
+            mean_reward = results.total_scores.mean()
+            losses.append(float(loss))
+            rewards.append(float(mean_reward))
+
+            if initial_loss is None:
+                initial_loss = float(loss)
+
+            logger.info(f"  📉 Loss: {loss:.4f}")
+            logger.info(f"  📊 Mean reward: {mean_reward:.4f}")
+            logger.info(f"  📈 Agent NLLs: {agent_lls.mean():.4f}")
+
+            # Commit model to NATS and notify swarm
+            new_version = learner_node.model_version + 1
+            logger.info(f"  💾 Committing model version {new_version}")
+            await learner_node.commit_model(learner._state.agent.model)
+            logger.info(f"  ✅ Model v{new_version} published to actors")
+
             await asyncio.sleep(0.5)
         
         # Summary statistics
@@ -339,10 +361,10 @@ async def run_learner_loop(learner: ImpalaLearner, learner_node: LearnerNode, nu
             logger.info(f"  Mean reward (last): {rewards[-1]:.4f}")
             logger.info(f"  Reward improvement: {((rewards[-1] - rewards[0]) / max(abs(rewards[0]), 0.001) * 100):.2f}%")
             logger.info(f"  Total model updates: {learner_node.model_version}")
-        
+
         await learner_node.close()
         logger.info("✅ Learner Loop Complete")
-        
+
     except asyncio.CancelledError:
         logger.info("⚠️  [Learner] Cancelled, cleaning up...")
         try:
@@ -415,7 +437,7 @@ async def main():
         DEVICE = "cpu"  # Use CPU for testing
         BATCH_SIZE = 16  # Small batch for testing
         NUM_ACTORS = 5
-        NUM_ITERATIONS = 20  # Number of actor/learner cycles (increased for more training)
+        NUM_ITERATIONS = 10  # Number of actor/learner cycles (increased for more training)
         ACTOR_DELAY = 3.0  # Delay between actor iterations in seconds (slow down actors)
         
         logger.info("\nConfiguration:")
@@ -632,7 +654,8 @@ async def main():
                 actor_node = ActorNode(
                     actor=actor,
                     worker_id=f"actor_{actor_id}",
-                    queue_url=NATS_URL
+                    queue_url=NATS_URL,
+                    swarm_manager=swarm
                 )
                 
                 if not await actor_node.Connect():
@@ -662,7 +685,7 @@ async def main():
             ]
             
             learner_task = asyncio.create_task(
-                run_learner_loop(learner, learner_node, num_iterations=NUM_ITERATIONS)
+                run_learner_loop(learner, learner_node)
             )
             
             # Wait for all tasks to complete

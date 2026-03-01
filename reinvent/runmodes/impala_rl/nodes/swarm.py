@@ -52,7 +52,8 @@ class Swarm:
         self.js: Optional[JetStreamContext] = None
         self.actors: List[ActorNode] = []
         self.running = False
-        
+        self.latest_model_version: int = 0  # Track latest model version for lag calculation
+
         logger.info(f"[Swarm] Initialized with {num_actors} actors")
     
     async def connect(self):
@@ -92,33 +93,20 @@ class Swarm:
         """
         logger.info(f"[Swarm] Creating {self.num_actors} actor(s)...")
         
-        for i in range(self.num_actors):
-            actor_node = ActorNode(
-                actor_id=i,
-                model=model,
-                sampler=sampler,
-                scoring_function=scoring_function,
-                nats_url=self.nats_url,
-                publish_subject=publish_subject,
-            )
-            
-            await actor_node.connect()
-            self.actors.append(actor_node)
-            logger.info(f"[Swarm] Actor {i} created and connected")
-        
-        logger.info(f"[Swarm] All {len(self.actors)} actors ready")
+        # NOTE: This method is currently not used - actors are created manually in tests
+        # TODO: Update this method to match current ActorNode constructor signature
+        logger.warning("[Swarm] create_actors() is deprecated and not functional")
         return self.actors
     
     async def _handle_model_update(self, msg):
         """
         Handle model update notification from learner.
-        
-        Message format (JSON):
-        {
-            "version": int,
-            "bucket": str,
-            "key": str
-        }
+
+        Pull-based design: swarm does NOT push/broadcast the model to actors.
+        Instead it records the latest {version, bucket, key} directly on each
+        ActorNode.  Every actor pulls the model on its own schedule, right after
+        finishing a trajectory batch (in SendTrajectories → _maybe_pull_model).
+        This eliminates broadcast timeouts, lock contention, and version skipping.
         """
         try:
             import json
@@ -126,41 +114,22 @@ class Swarm:
             version = data["version"]
             bucket = data["bucket"]
             key = data["key"]
-            
-            logger.info(f"[Swarm] Received model update notification: version={version}")
-            
-            # Broadcast update to all actors
-            await self._broadcast_model_update(version, bucket, key)
-            
+
+            self.latest_model_version = version
+            update_info = {"version": version, "bucket": bucket, "key": key}
+
+            # Propagate to all actor nodes so they can pull when ready.
+            for actor in self.actors:
+                actor._swarm_latest_version = version
+                actor._latest_model_info = update_info
+
+            logger.info(
+                f"[Swarm] Model v{version} available — "
+                f"{len(self.actors)} actors will pull on next cycle"
+            )
+
         except Exception as e:
             logger.error(f"[Swarm] Error handling model update: {e}")
-    
-    async def _broadcast_model_update(self, version: int, bucket: str, key: str):
-        """
-        Broadcast model update to all actors.
-        
-        Args:
-            version: New model version number
-            bucket: NATS KV bucket name where model is stored
-            key: Key in the bucket where model is stored
-        """
-        logger.info(f"[Swarm] Broadcasting model update v{version} to {len(self.actors)} actors")
-        
-        update_tasks = []
-        for actor in self.actors:
-            task = asyncio.create_task(
-                actor.load_model_from_nats(version, bucket, key)
-            )
-            update_tasks.append(task)
-        
-        # Wait for all actors to update
-        results = await asyncio.gather(*update_tasks, return_exceptions=True)
-        
-        success_count = sum(1 for r in results if not isinstance(r, Exception))
-        logger.info(f"[Swarm] Model update complete: {success_count}/{len(self.actors)} actors updated")
-        
-        if success_count < len(self.actors):
-            logger.warning(f"[Swarm] {len(self.actors) - success_count} actors failed to update")
     
     async def start(self):
         """Start the swarm and keep it running."""

@@ -24,7 +24,7 @@ def run_query(query):
         return f"Exception: {e}"
 
 def main():
-    run_id = sys.argv[1] if len(sys.argv) > 1 else "1772308951_ed9db67b"
+    run_id = sys.argv[1] if len(sys.argv) > 1 else "1772315448_1a33f518"
     output_file = sys.argv[2] if len(sys.argv) > 2 else "logs.txt"
     
     print(f"💾 Fetching data for run_id: {run_id}")
@@ -40,12 +40,13 @@ def main():
         f.write("📊 ALL METRICS FOR THIS RUN\n")
         f.write("-" * 100 + "\n")
         
-        query = f"""
-        SELECT 
+        # Note: distributed_samples_v4 contains unix_milli, metric_name, fingerprint, value.
+        # Attributes/labels live in a separate dimension table; don't SELECT them here.
+        query = """
+        SELECT
           toDateTime(unix_milli/1000) as timestamp,
           metric_name,
-          value,
-          attributes
+          value
         FROM signoz_metrics.distributed_samples_v4
         WHERE toDateTime(unix_milli/1000) >= now() - INTERVAL 2 HOUR
         ORDER BY timestamp

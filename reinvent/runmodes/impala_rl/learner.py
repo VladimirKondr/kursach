@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import math
 
 from reinvent.runmodes.RL.reinvent import ReinventLearning
 
@@ -146,6 +147,10 @@ class ImpalaLearner(ReinventLearning):
             span.add_event("backward_pass")
             self.reward_nlls._optimizer.zero_grad()
             loss.backward()
+            # Gradient clipping to prevent explosion from off-policy trajectories
+            torch.nn.utils.clip_grad_norm_(
+                self._state.agent.model.network.parameters(), max_norm=1.0
+            )
             self.reward_nlls._optimizer.step()
 
             ### FROM RLReward.__call__()
@@ -195,20 +200,22 @@ class ImpalaLearner(ReinventLearning):
             record_duration_metric("learner.compute_target_log_probs.duration", duration)
             span.set_attribute("num_trajectories", len(self.trajectories))
     
-    def _compute_importance_weights(self, clip_rho=10.0, normalize=True):
+    def _compute_importance_weights(self, clip_rho=5.0, normalize=True):
         """Compute importance weights for off-policy correction using Clipped IS.
         
-        Clipped Importance Sampling:
+        Clipped Importance Sampling (V-trace style):
             w_i = min(clip_rho, π_target(τ_i) / π_behavior(τ_i))
             
-        With normalization (Self-normalized IS):
-            w̃_i = w_i / Σ_j w_j
+        Clipping is performed in log-space first, then numerically-stable exp:
+            log_w_i = min(log(clip_rho), log_ratio_i)     <-- actual clipping
+            w_i = exp(log_w_i - max(log_w))               <-- stable exp (cancels in normalization)
             
-        This prevents weights from being too small and provides more stable learning.
-        
+        With normalization (Self-normalized IS):
+            w̃_i = w_i / Σ_j w_j * N    (unbiased; N = batch size)
+            
         Args:
-            clip_rho: Clipping parameter for importance weight (default: 10.0)
-            normalize: Whether to normalize weights (default: True)
+            clip_rho: Clipping threshold for importance weight (default: 5.0)
+            normalize: Whether to apply self-normalized IS (default: True)
             
         Returns:
             Tensor of importance weights [batch_size]
@@ -222,40 +229,44 @@ class ImpalaLearner(ReinventLearning):
                 if traj.target_log_prob is None:
                     raise ValueError("Trajectory missing target_log_prob. Call _compute_target_log_probs first.")
                 
-                # Compute importance ratio for entire trajectory
+                # Compute log importance ratio for entire trajectory
                 target_log_prob_sum = traj.target_log_prob.sum()
                 behavior_log_prob_sum = traj.behavior_log_prob.sum()
                 log_ratio = target_log_prob_sum - behavior_log_prob_sum
                 log_ratios.append(log_ratio)
             
-            # Convert log ratios to tensor for stable computation
+            # Convert log ratios to tensor
             log_ratios = torch.stack(log_ratios)
             
-            # For numerical stability, use log-sum-exp trick
-            # w = exp(log_ratio - max(log_ratios)) to avoid overflow/underflow
-            max_log_ratio = log_ratios.max()
-            importance_ratios = torch.exp(log_ratios - max_log_ratio)
+            # Step 1: Clip in log-space BEFORE any numerical tricks.
+            # This is the actual V-trace IS clipping: w_i = min(clip_rho, ratio_i).
+            # Previous code applied log-sum-exp shift BEFORE clipping, which made
+            # clamp(max=clip_rho) a dead operation (all shifted values were ≤ 1.0).
+            log_clip_rho = math.log(clip_rho)
+            clipped_log_ratios = torch.clamp(log_ratios, max=log_clip_rho)
             
-            # Clip importance weights
-            clipped_weights = torch.clamp(importance_ratios, min=0.0, max=clip_rho)
+            # Step 2: Numerical stability for exp — subtract max of the CLIPPED ratios.
+            # This shift cancels out during normalization, so it doesn't affect the result.
+            center = clipped_log_ratios.max()
+            importance_weights = torch.exp(clipped_log_ratios - center)
             
-            # Normalize weights if requested
+            # Step 3: Self-normalized IS
             if normalize:
-                weight_sum = clipped_weights.sum()
+                weight_sum = importance_weights.sum()
                 if weight_sum > 0:
-                    normalized_weights = clipped_weights / weight_sum * len(clipped_weights)
+                    weights_final = importance_weights / weight_sum * len(importance_weights)
                 else:
-                    # If all weights are zero, use uniform weights
-                    normalized_weights = torch.ones_like(clipped_weights)
-                weights_final = normalized_weights
+                    weights_final = torch.ones_like(importance_weights)
             else:
-                weights_final = clipped_weights
+                weights_final = importance_weights
             
             duration = time.perf_counter() - start_time
             record_duration_metric("learner.compute_importance_weights.duration", duration)
             span.set_attribute("num_weights", len(weights_final))
             span.set_attribute("clip_rho", clip_rho)
             span.set_attribute("normalize", normalize)
+            span.set_attribute("log_ratio_min", float(log_ratios.min().item()))
+            span.set_attribute("log_ratio_max", float(log_ratios.max().item()))
             
             return weights_final.to(self._state.agent.device)
 
@@ -267,7 +278,7 @@ class ImpalaLearner(ReinventLearning):
         for step in range(self.max_steps):
             # Get trajectories from learner node
             self.trajectories: list[Trajectory] = asyncio.run(
-                self.learner_node.GetTrajectories(self.sampling_model.batch_size)
+                self.learner_node.GetTrajectories(batch_size=self.sampling_model.batch_size)
             )
             # Move trajectories to device
             self.trajectories = [traj.to(self._state.agent.device) for traj in self.trajectories]
