@@ -43,6 +43,14 @@ class ImpalaLearner(ReinventLearning):
     _score_ema: float = 0.5
     _score_ema_alpha: float = 0.05  # slower baseline tracking → sigma*(s-ema) stays non-zero longer
 
+    # EMA-smoothed loss for cleaner monitoring in dashboards.
+    # The raw per-step DAP loss is (sigma * score)^2 ≈ 800-2000 and oscillates
+    # because each batch samples different molecules with different prior_nlls.
+    # This EMA (α=0.1, ~10-step window) smooths out that per-batch noise while
+    # still reflecting the true convergence trend.
+    _loss_ema: float = float("nan")   # NaN until the first update
+    _loss_ema_alpha: float = 0.1
+
     def subscribe(self, learner_node: LearnerNode):
         self.learner_node = learner_node
 
@@ -234,7 +242,18 @@ class ImpalaLearner(ReinventLearning):
             # Record metrics
             update_duration = time.perf_counter() - update_start
             record_duration_metric("learner.update.duration", update_duration)
-            record_value_metric("learner.loss", float(loss.item()))
+
+            raw_loss = float(loss.item())
+            # EMA-smoothed loss: reduces per-batch noise from varying batch
+            # composition (different molecules → different prior_nlls → different
+            # absolute DAP loss even at steady state).  Use this for dashboards.
+            if math.isnan(self._loss_ema):
+                self._loss_ema = raw_loss
+            else:
+                self._loss_ema = (1 - self._loss_ema_alpha) * self._loss_ema + self._loss_ema_alpha * raw_loss
+            record_value_metric("learner.loss", raw_loss)
+            record_value_metric("learner.loss_ema", self._loss_ema)
+
             record_value_metric("learner.agent_nll.mean", float(agent_nlls.mean().item()))
             record_value_metric("learner.prior_nll.mean", float(prior_nlls.mean().item()))
 
@@ -344,22 +363,21 @@ class ImpalaLearner(ReinventLearning):
             # Convert log ratios to tensor
             log_ratios = torch.stack(log_ratios)
             
-            # Step 1: Clip in log-space BEFORE any numerical tricks.
-            # Symmetric clipping: clamp(log_ratio, [-log_rho, +log_rho])
-            # Upper clip: prevents over-weighting fresh (near on-policy) trajectories.
-            # Lower clip: CRITICAL for same-machine distributed setup.
-            #   Without it, very stale actors (3-5 versions behind) produce
-            #   log_ratio << 0 → IS weight → 0 → effective batch shrinks from 32
-            #   to ~5-8 trajectories → loss variance explodes.
-            #   Symmetric clipping keeps every trajectory's weight in [1/rho, rho],
-            #   so all 32 trajectories always contribute meaningfully.
+            # Clip in log-space: clamp(log_ratio, [-log_rho, +log_rho]).
+            # After clipping, all values are in [-log(2), +log(2)] ≈ [-0.693, +0.693],
+            # so exp() is in [0.5, 2.0] — numerically safe without any centering trick.
+            #
+            # We deliberately do NOT subtract the max before exp() here.
+            # Max-centering shifts the largest weight to 1.0 and all others below 1.0.
+            # After self-normalization that single trajectory absorbs weight ≈ N while
+            # the rest get ≈ 0 — which defeats the purpose of IS correction and causes
+            # the same loss-variance explosion as having no clipping at all.
+            # With symmetric clipping the range is already bounded, so centering is
+            # unnecessary and harmful.
             log_clip_rho = math.log(clip_rho)
             clipped_log_ratios = torch.clamp(log_ratios, min=-log_clip_rho, max=log_clip_rho)
 
-            # Numerical stability: subtract max before exp.
-            # The shift cancels out during self-normalization.
-            center = clipped_log_ratios.max()
-            importance_weights = torch.exp(clipped_log_ratios - center)
+            importance_weights = torch.exp(clipped_log_ratios)
 
             # Self-normalized IS: w̃_i = w_i / Σw_j * N
             if normalize:

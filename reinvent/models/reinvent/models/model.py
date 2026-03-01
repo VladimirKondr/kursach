@@ -209,43 +209,42 @@ class Model:
     def _compute_token_log_probs(self, sequence: torch.Tensor) -> torch.Tensor:
         """
         Compute log probabilities for each token in a sequence.
-        
+
+        Mirrors exactly what likelihood() does so that behavior_log_probs
+        (computed during sampling via _sample_impala) and target_log_probs
+        (computed here by the learner) share the same RNN context.  Both must
+        feed sequence[:-1] = [START, t1, ..., tN-1] into the RNN and read
+        out log-probs for sequence[1:] = [t1, ..., tN].
+
+        Using generated_tokens = sequence[1:] as the RNN *input* (old code)
+        caused a context mismatch: the RNN never saw START, so every
+        token's hidden state was off-by-one.  That made log π_target ≠
+        log π_behavior even for a freshly-copied model, so IS weights were
+        garbage (max ≈ N, min ≈ 0) instead of all-ones.
+
         Args:
             sequence: Token sequence of shape [seq_len] including START token
-            
+
         Returns:
             Log probabilities for each generated token (excluding START), shape [seq_len-1]
         """
         with torch.no_grad():
-            # Skip the START token - we don't have a log prob for it
-            # sequence[0] is START token, sequence[1:] are generated tokens
             if len(sequence) <= 1:
                 return torch.tensor([], device=sequence.device)
-            
-            generated_tokens = sequence[1:]  # Exclude START token
-            
-            # Add batch dimension: [seq_len-1] -> [1, seq_len-1]
-            seq_batch = generated_tokens.unsqueeze(0)
-            
-            # Get model output (logits)
-            logits, _ = self.network(seq_batch)
-            # logits shape: [1, seq_len-1, vocab_size]
-            
-            # Trim logits to match sequence length (needed for teacher forcing)
-            # During teacher forcing, model outputs predictions for all input positions
-            # We need to match each input token with its corresponding output logit
-            min_len = min(logits.size(1), len(generated_tokens))
-            logits = logits[:, :min_len, :]
-            sequence_trimmed = generated_tokens[:min_len]
-            
-            log_probs = logits.log_softmax(dim=2)  # shape: [1, min_len, vocab_size]
-            
-            # Remove batch dimension: [1, min_len, vocab_size] -> [min_len, vocab_size]
-            log_probs = log_probs.squeeze(dim=0)
-            
-            # Extract log prob for each actual token
-            token_log_probs = log_probs[torch.arange(min_len), sequence_trimmed]
-            
+
+            # Feed [START, t1, ..., tN-1] → predict [t1, ..., tN]
+            # This is identical to the inner loop of likelihood().
+            rnn_input = sequence[:-1].unsqueeze(0)   # [1, seq_len-1]
+            target_tokens = sequence[1:]             # [seq_len-1]
+
+            logits, _ = self.network(rnn_input)      # [1, seq_len-1, vocab_size]
+
+            log_probs = logits.log_softmax(dim=2).squeeze(0)  # [seq_len-1, vocab_size]
+
+            # Guard against length mismatch from truncation at max_sequence_length
+            min_len = min(log_probs.size(0), len(target_tokens))
+            token_log_probs = log_probs[:min_len, :][torch.arange(min_len), target_tokens[:min_len]]
+
             return token_log_probs
 
     def _sample(self, batch_size: int = 128) -> Tuple[torch.Tensor, torch.Tensor]:

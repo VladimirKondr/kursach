@@ -37,8 +37,13 @@ NATS_URL = "localhost:4222"
 DEVICE = "cpu"  # Use CPU for testing
 BATCH_SIZE = 16  # Small batch for testing
 NUM_ACTORS = 5
-NUM_ITERATIONS = 200  # Number of actor/learner cycles (increased for more training)
-ACTOR_DELAY = 2.0  # Delay between actor iterations in seconds
+NUM_ITERATIONS = 100  # Number of actor/learner cycles (increased for more training)
+ACTOR_DELAY = 2.0  # Simulates network/transfer overhead between remote actor and learner machines
+
+# Learner batch size: how many trajectories to collect before each gradient step.
+# With BATCH_SIZE=16 per actor and NUM_ACTORS=5 this gives 2-3 actor rounds per
+# learner update, keeping gradient estimates stable.
+LEARNER_BATCH_SIZE = 64
 
 # Setup logging
 logging.basicConfig(
@@ -353,7 +358,7 @@ async def run_actor_loop(actor_node: ActorNode, num_iterations: int = 5, delay: 
             if new_version > current_version:
                 logger.info(f"🔄 [Actor {actor_id}] Model updated: v{current_version} → v{new_version}")
             
-            # Slow down to allow learner to catch up
+            # Yield event loop (delay=0.0 — artificial throttle removed)
             await asyncio.sleep(delay)
         
         await actor_node.Close()
@@ -368,10 +373,7 @@ async def run_actor_loop(actor_node: ActorNode, num_iterations: int = 5, delay: 
         raise
 
 
-# Learner batch size: how many trajectories to collect before each gradient step.
-# With BATCH_SIZE=16 per actor and NUM_ACTORS=5 this gives 2-3 actor rounds per
-# learner update, keeping gradient estimates stable.
-LEARNER_BATCH_SIZE = 64
+
 
 
 async def run_learner_loop(learner: ImpalaLearner, learner_node: LearnerNode,
@@ -460,7 +462,7 @@ async def run_learner_loop(learner: ImpalaLearner, learner_node: LearnerNode,
             await learner_node.commit_model(learner._state.agent.model)
             logger.info(f"  ✅ Model v{new_version} published to actors")
 
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0)  # yield event loop (was 0.5s artificial delay)
         
         # Summary statistics
         if losses:

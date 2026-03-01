@@ -1,3 +1,4 @@
+import random
 from typing import Optional
 from collections import deque
 
@@ -39,11 +40,23 @@ class TrajectoryBuffer:
             result = list(self.buffer)
             self.buffer.clear()
             return result
-        
+
+        # Random sampling without replacement: draw random indices,
+        # remove them from the buffer to avoid training on the same
+        # trajectory twice.  This breaks the LIFO temporal correlation
+        # that caused loss variance to spike whenever actor timing changed.
+        indices = sorted(random.sample(range(len(self.buffer)), batch_size), reverse=True)
         sampled: list[Trajectory] = []
-        for i in range(batch_size):
-            sampled.append(self.buffer.pop())
-        
+        buf_list = list(self.buffer)
+        for idx in sorted(indices):
+            sampled.append(buf_list[idx])
+        # Rebuild deque without sampled elements
+        sampled_set = set(indices)
+        self.buffer = deque(
+            (item for i, item in enumerate(buf_list) if i not in sampled_set),
+            maxlen=self.maxlen,
+        )
+
         return sampled
     
     def clear(self):
